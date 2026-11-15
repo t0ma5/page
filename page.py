@@ -1208,8 +1208,21 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         ctk.CTkLabel(ring, text="!", text_color=WARN, font=(self.ui_font, 26, "bold"),
                      fg_color="transparent").place(relx=0.5, rely=0.5, anchor="center")
         ctk.CTkLabel(body, text="Warning", font=(self.ui_font, 22, "bold")).pack()
-        ctk.CTkLabel(body, text=ADMIN_WARNING.removeprefix("Warning: "), font=(self.ui_font, 14),
-                     wraplength=380, justify="center").pack(pady=(8, 0))
+        # A read-only text area instead of a label, so the app's name can be bold:
+        # "<b>page</b> is running as administrator. ... Close <b>page</b> and ...".
+        text = ctk.CTkTextbox(body, width=400, height=84, wrap="word", font=(self.ui_font, 14),
+                              fg_color="transparent", border_width=0, activate_scrollbars=False)
+        text.pack(pady=(8, 0))
+        inner = text._textbox
+        regular = tkfont.Font(font=inner.cget("font"))
+        bold = regular.copy()
+        bold.configure(weight="bold")
+        inner.tag_configure("center", justify="center")
+        inner.tag_configure("bold", font=bold)
+        for part in re.split(r"\b(page)\b", ADMIN_WARNING.removeprefix("Warning: ")):
+            if part:
+                text.insert("end", part, ("center", "bold") if part == APP_NAME else ("center",))
+        text.configure(state="disabled", cursor="arrow")  # 3 lines at this width fit height=84
         close = ctk.CTkButton(body, text="Close", width=100, height=32, command=win.destroy,
                               font=self.small_font)
         close.pack(pady=(18, 0))

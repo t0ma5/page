@@ -4,6 +4,9 @@
 
 # page v0.1.0
 
+> [!TIP]
+> **Use [sage](https://github.com/t0ma5/sage) instead.** sage is the same app, made by the same author, as a single exe with the official age library built in: no separate age tools to keep next to it, and it is where new features go. page stays available and gets fixes, but no new features.
+
 **page** = **P**ython GUI for **age**. A small window for encrypting and decrypting files with [age](https://age-encryption.org) on Windows.
 
 - **Portable: one folder, nothing to install.** Unzip it anywhere (a USB stick works) and run `page.exe`. The folder holds page and the official age tools (`age.exe`, `age-keygen.exe`, `age-inspect.exe`, `age-plugin-batchpass.exe`); keep them side by side.
