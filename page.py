@@ -85,6 +85,25 @@ ADMIN_WARNING = ("Warning: page is running as administrator. Windows hides drive
                  "from it, also blocks drag & drop from Explorer. Close page and start it normally.")
 
 
+BULLET = "• "
+SUB_BULLET = "  • "
+
+
+def bullet_lines(text):
+    """Split box text into (prefix, body, tag) lines: each line gets a bullet, a line
+    starting with spaces is a sub-item, and a blank line stays blank."""
+    out = []
+    for raw in text.split("\n"):
+        body = raw.strip()
+        if not body:
+            out.append(("", "", None))
+        elif raw[:1].isspace():
+            out.append((SUB_BULLET, body, "sub"))
+        else:
+            out.append((BULLET, body, "ln"))
+    return out
+
+
 def describe_add_error(path, exc):
     """Why a dropped or chosen path can't be added, as (text, drive_missing)."""
     drive = os.path.splitdrive(path)[0]
@@ -799,9 +818,20 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         self.file_box.configure(state="normal")
         if clear_first:
             self.file_box.delete("0.0", "end")
-        self.file_box.insert("end", text + "\n")
+        self._configure_bullet_tags()
+        for prefix, body, tag in bullet_lines(text):
+            self.file_box.insert("end", prefix + body + "\n", tag)
         self.file_box.see("end")
         self.file_box.configure(state="disabled")
+
+    def _configure_bullet_tags(self):
+        """Wrapped text lines up under the first word, after the bullet."""
+        if getattr(self, "_bullet_tags_ready", False):
+            return
+        font = tkfont.Font(font=self.file_box._textbox.cget("font"))
+        for tag, prefix in (("ln", BULLET), ("sub", SUB_BULLET)):
+            self.file_box.tag_config(tag, lmargin1=0, lmargin2=font.measure(prefix))
+        self._bullet_tags_ready = True
 
     def log_to_box(self, text, clear_first=False):
         """Thread-safe: Tk widgets are only touched from the main thread."""

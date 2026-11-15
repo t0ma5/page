@@ -126,6 +126,17 @@ class AdminWarning(unittest.TestCase):
         self.assertNotIn("administrator", self.lines(False))
 
 
+class Bullets(unittest.TestCase):
+    def test_lines_sub_items_and_blanks(self):
+        got = page.bullet_lines("Drop files here.\n\n  .age files are decrypted.\nDone.")
+        self.assertEqual(got, [
+            (page.BULLET, "Drop files here.", "ln"),
+            ("", "", None),
+            (page.SUB_BULLET, ".age files are decrypted.", "sub"),
+            (page.BULLET, "Done.", "ln"),
+        ])
+
+
 class AddProblems(unittest.TestCase):
     """Dropped paths that can't be read are explained instead of "No files found"."""
 
