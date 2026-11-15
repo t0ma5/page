@@ -111,28 +111,36 @@ def strip_bullets(text):
 NET_UNREACHABLE = {53, 64, 67, 1222}
 
 
+def without_long_prefix(path):
+    r"""The path without the \\?\ long-path prefix (\\?\UNC\server\share -> \\server\share)."""
+    if path.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + path[8:]
+    if path.startswith("\\\\?\\"):
+        return path[4:]
+    return path
+
+
 def describe_add_error(path, exc):
-    """Why a dropped or chosen path can't be added, as (text, drive_missing).
-    drive_missing is only for drive letters: a mapped drive page can't see."""
-    drive = os.path.splitdrive(path)[0]
+    """Why a dropped or chosen path can't be added, in words a user can act on."""
+    drive = os.path.splitdrive(without_long_prefix(path))[0]
     if drive.startswith("\\\\"):
         # A network share: the server or share is the problem, not a hidden drive.
         # Decided from the error alone, so there's no second network timeout.
         if getattr(exc, "winerror", None) in NET_UNREACHABLE:
-            return f"{path}: network share {drive} isn't reachable.", False
+            return f"{path}: network share {drive} isn't reachable."
     elif drive and not os.path.exists(drive + os.sep):
-        return f"{path}: drive {drive} isn't available to page.", True
+        return f"{path}: drive {drive} isn't available to page."
     if isinstance(exc, FileNotFoundError):
-        return f"{path}: not found (moved or deleted?).", False
+        return f"{path}: not found (moved or deleted?)."
     if isinstance(exc, PermissionError):
-        return f"{path}: access denied.", False
-    return f"{path}: can't be read ({getattr(exc, 'strerror', None) or exc}).", False
+        return f"{path}: access denied."
+    return f"{path}: can't be read ({getattr(exc, 'strerror', None) or exc})."
 
 
 def problem_lines(problems):
     """List unreadable paths, at most 5. (When page runs as administrator the window
     shows a permanent warning line, so it isn't repeated here.)"""
-    lines = [f"  {text}" for text, _ in problems[:5]]
+    lines = [f"  {text}" for text in problems[:5]]
     if len(problems) > 5:
         lines.append(f"  ...and {len(problems) - 5} more.")
     return "\n".join(lines)
@@ -448,9 +456,12 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         # Running as administrator: a permanent line above the box, so file lists and
         # job logs can't push it out of view.
         if running_elevated():
+            # A small starting wraplength so it never widens the window; wrap_to_width then
+            # follows the real width (and rewraps on resize).
             self.admin_banner = ctk.CTkLabel(files_frame, text=ADMIN_WARNING, text_color=WARN, font=small_font,
-                                             wraplength=540, justify="left", anchor="w")
+                                             wraplength=300, justify="left", anchor="w")
             self.admin_banner.pack(fill="x", pady=(6, 0))
+            self.wrap_to_width(self.admin_banner, side_padding=0)
 
         self.drop_border = ctk.ThemeManager.theme["CTkTextbox"]["border_color"]
         # A small requested height: the box still expands into all free space, but Tk
@@ -632,7 +643,9 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         # Same size as sage (590 x 660), so the two apps look alike.
         width = min(590, int(sw / scaling) - 20)
         height = min(660, int((sh - title_bar) / scaling) - 10)
-        self.minsize(min(520, width), min(540, height))
+        # The administrator warning line takes about 45 px more; don't let it squeeze the tab card.
+        min_height = 540 + (45 if getattr(self, "admin_banner", None) is not None else 0)
+        self.minsize(min(520, width), min(min_height, height))
         x = sx + max(0, (sw - int(width * scaling)) // 2)
         y = sy + max(0, (sh - int(height * scaling) - title_bar) // 2)
         self.geometry(f"{width}x{height}+{x}+{y}")
@@ -857,6 +870,7 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         under the first word. plain=True writes the text as it is (tool output such as
         age-inspect's, which has its own layout)."""
         # The box is read-only for the user; unlock it only while writing.
+        self._refresh_bullet_tags()  # cheap: re-measures only if the font changed
         self.file_box.configure(state="normal")
         if clear_first:
             self.file_box.delete("0.0", "end")
@@ -1243,7 +1257,7 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
                 p = os.path.normpath(os.path.abspath(p))
                 info = os.stat(long_path(p))
             except ValueError:
-                self.add_problems.append((f"{p}: not a valid path.", False))
+                self.add_problems.append(f"{p}: not a valid path.")
                 continue
             except OSError as exc:
                 self.add_problems.append(describe_add_error(p, exc))

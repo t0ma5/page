@@ -111,14 +111,12 @@ class Secrets(unittest.TestCase):
 
 
 class AdminWarning(unittest.TestCase):
-    def lines(self, elevated):
+    def startup_text(self):
         from types import SimpleNamespace
-        from unittest import mock
 
         fake = SimpleNamespace(age_path=sys.executable, batchpass_path=sys.executable,
                                keygen_path=sys.executable, inspect_path=sys.executable)
-        with mock.patch.object(page, "running_elevated", return_value=elevated):
-            return "\n".join(page.AgeGui.startup_status_lines(fake))
+        return "\n".join(page.AgeGui.startup_status_lines(fake))
 
     def test_exact_wording(self):
         # The owner's wording, word for word.
@@ -127,9 +125,8 @@ class AdminWarning(unittest.TestCase):
                          "account from it, also blocks drag & drop from Explorer. Close page and start it normally.")
 
     def test_not_in_the_box(self):
-        # It's a permanent line above the box, not part of the box text.
-        self.assertNotIn("administrator", self.lines(True))
-        self.assertNotIn("administrator", self.lines(False))
+        # It's a permanent line above the box, never part of the box text.
+        self.assertNotIn("administrator", self.startup_text())
 
     def test_elevation_check_runs(self):
         self.assertIsInstance(page.running_elevated(), bool)
@@ -167,30 +164,38 @@ class AddProblems(unittest.TestCase):
             files, problems = self.expand([ok, os.path.join(d, "gone.txt")])
             self.assertEqual(files, [ok])
             self.assertEqual(len(problems), 1)
-            self.assertIn("gone.txt: not found (moved or deleted?).", problems[0][0])
-            self.assertFalse(problems[0][1])
+            self.assertTrue(problems[0].endswith("gone.txt: not found (moved or deleted?)."))
         free = next((c for c in "ZYXWVUTSRQPONMLKJIHG" if not os.path.exists(c + ":\\")), None)
         if os.name != "nt" or free is None:
             self.skipTest("needs Windows and a free drive letter")
         missing = free + r":\vault\file.txt"
         files, problems = self.expand([missing])
         self.assertEqual(files, [])
-        self.assertEqual(problems[0], (missing + ": drive " + free + ": isn't available to page.", True))
+        self.assertEqual(problems, [missing + ": drive " + free + ": isn't available to page."])
         self.assertNotIn("administrator", page.problem_lines(problems))
+        # The same drive behind the long-path prefix is still a drive, not a network share.
+        prefixed = "\\\\?\\" + missing
+        self.assertEqual(page.describe_add_error(prefixed, FileNotFoundError(2, "x")),
+                         prefixed + ": drive " + free + ": isn't available to page.")
 
     def test_reasons(self):
         p = os.path.join(tempfile.gettempdir(), "x.txt")
-        self.assertEqual(page.describe_add_error(p, PermissionError(13, "denied")), (p + ": access denied.", False))
-        self.assertEqual(page.describe_add_error(p, OSError(5, "boom")), (p + ": can't be read (boom).", False))
+        self.assertEqual(page.describe_add_error(p, PermissionError(13, "denied")), p + ": access denied.")
+        self.assertEqual(page.describe_add_error(p, OSError(5, "boom")), p + ": can't be read (boom).")
         if os.name != "nt":
             return
         # An unreachable share is the server's problem, not a hidden drive (and no second network stat).
         unc = r"\\nas\share\a.txt"
-        err = OSError(2, "The network path was not found", None, 53)
-        self.assertEqual(page.describe_add_error(unc, err), (unc + r": network share \\nas\share isn't reachable.", False))
+        for code in (53, 64, 67, 1222):
+            err = OSError(2, "network error", None, code)
+            self.assertEqual(page.describe_add_error(unc, err), unc + r": network share \\nas\share isn't reachable.")
+        long_unc = "\\\\?\\UNC\\nas\\share\\a.txt"
+        self.assertEqual(page.describe_add_error(long_unc, OSError(2, "x", None, 53)),
+                         long_unc + r": network share \\nas\share isn't reachable.")
+        self.assertEqual(page.without_long_prefix(long_unc), unc)
 
     def test_long_lists_are_cut(self):
-        problems = [(f"p{i}: not found (moved or deleted?).", False) for i in range(8)]
+        problems = [f"p{i}: not found (moved or deleted?)." for i in range(8)]
         text = page.problem_lines(problems)
         self.assertEqual(text.count("\n"), 5)
         self.assertTrue(text.endswith("  ...and 3 more."))

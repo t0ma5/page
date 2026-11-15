@@ -112,7 +112,7 @@ age.exe -d -i <identity> ... <file>             (identities)
 
 ## Tests
 
-`tests	est_page.py` checks the file handling without opening a window: output naming, `.part` files, the settings filter, recipients-file checks, and real round trips through `age.exe` (passphrase, wrong passphrase, and age's own check of the recipients). From this folder:
+`tests\test_page.py` checks the file handling without opening a window: output naming, `.part` files, the settings filter, recipients-file checks, and real round trips through `age.exe` (passphrase, wrong passphrase, and age's own check of the recipients). From this folder:
 
 ```text
 python -m unittest discover -s tests -v
