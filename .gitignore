@@ -1,0 +1,17 @@
+# Built by the release workflow (or locally with PyInstaller); not committed.
+page.exe
+build/
+dist/
+*.spec
+__pycache__/
+
+# The official age tools are downloaded by the workflow (checksums pinned); not committed.
+age.exe
+age-keygen.exe
+age-inspect.exe
+age-plugin-*.exe
+
+# Personal files written next to page.exe.
+pageSettings.json
+pageSettings.json.*
+log.txt
