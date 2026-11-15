@@ -108,6 +108,10 @@ jobs:
           # age is BSD-3-Clause: its licence must ship with its binaries.
           Copy-Item agezip\age\LICENSE "$dir\LICENSE-age.txt"
           if (Test-Path LICENSE) { Copy-Item LICENSE $dir }
+          # Python, Tcl/Tk and the packages bundled into page.exe need their licences shipped too.
+          python tools\third_party_licenses.py
+          if ($LASTEXITCODE -ne 0) { throw "third_party_licenses.py failed" }
+          Copy-Item THIRD_PARTY_LICENSES.txt $dir
           New-Item -ItemType Directory -Force out | Out-Null
           Compress-Archive -Path "$dir\*" -DestinationPath "out\$name.zip"
 

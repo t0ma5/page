@@ -139,3 +139,7 @@ Then copy `dist\page.exe` into this folder. The exe looks for the age tools besi
 - [age](https://age-encryption.org) by Filippo Valsorda and Ben Cartwright-Cox (BSD-3-Clause). page runs the official `age.exe`, `age-keygen.exe`, `age-inspect.exe` and `age-plugin-batchpass.exe`.
 - [customtkinter](https://github.com/TomSchimansky/CustomTkinter) and [tkinterdnd2](https://github.com/Eliav2/tkinterdnd2) for the window and drag-and-drop.
 - Cover photo by Annie Spratt on [Unsplash](https://unsplash.com/photos/selective-focus-photography-of-opened-book-IQrPWwuTf5M).
+
+## License
+
+BSD-3-Clause, see [LICENSE](LICENSE). The release zips also contain `LICENSE-age.txt` (the bundled age tools) and `THIRD_PARTY_LICENSES.txt` (Python, Tcl/Tk, customtkinter, tkinterdnd2, Pillow and the other code bundled into `page.exe`, written by `tools/third_party_licenses.py`).
