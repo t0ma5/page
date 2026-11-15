@@ -17,27 +17,27 @@ page is unofficial and not affiliated with age's authors. age's own documentatio
 
 <p align="center">
   <img src="docs/screenshot-passphrase.png" alt="page, Passphrase tab" width="49%">
-  <img src="docs/screenshot-recipient.png" alt="page, Recipient tab" width="49%">
+  <img src="docs/screenshot-recipient.png" alt="page, Keys tab" width="49%">
 </p>
 
 ## Use it
 
 1. Start `page.exe`.
-2. Add files: drop files or folders on the file list, or use **Add files** / **Add folder**. Each addition joins the list; duplicates are skipped. A folder adds the files directly inside it, not subfolders (the list says how many subfolders were left out). **Clear** empties the list and the passphrase fields (saved recipients and identity files are kept).
-3. Choose a tab, **Passphrase** or **Recipient**, and fill it in (see below).
+2. Add files: drop files or folders anywhere on the window, or use the blue **Files** / **Folder** buttons. Each addition joins the list (name, folder, size); duplicates are skipped, and **×** removes a file. A folder adds the files directly inside it; the line under the list says how many subfolders were left out, and which paths couldn't be read and why. **Clear** empties the list and the passphrase fields (saved recipients and identity files are kept).
+3. Choose a tab, **Passphrase** or **Keys**, and fill it in (see below).
 4. Click the button at the bottom right (it reads e.g. **Encrypt 3 files** or **Decrypt 1 file**), or press Enter in a passphrase field.
 
-The line next to the button always says what is missing (for example "Repeat the passphrase to confirm it." or "Add an identity file under 'Decrypt with'."). After a run it shows the result, for example "Finished: 3 OK, 0 failed".
+The line next to the button always says what is missing (for example "Repeat the passphrase to confirm it." or "Add an identity file under 'Decrypt with'."). After a run, each file's row shows its result: a check mark and the file written (with a button that shows it in its folder), or what went wrong. Finished files stay in the list for reference but aren't processed again; failed ones are retried by the next run.
 
-**Encrypt or decrypt is chosen by the files:** `.age` files are decrypted, everything else is encrypted. A badge next to "Files" shows the mode and count. If a drop mixes both, only the `.age` files are kept and the rest are listed as ignored.
+**Encrypt or decrypt is chosen by the files:** `.age` files are decrypted, everything else is encrypted; the line under the list says which ("3 files will be encrypted"). If a drop mixes both, only the `.age` files are kept and the rest are listed as ignored.
 
 ### Passphrase tab
 
-For files encrypted with a passphrase (`age -p`). Encrypting asks for the passphrase twice. **Show passphrase** reveals it. A passphrase containing a line break (usually from pasting) is refused. The passphrase stays in the fields after a run so the next batch can reuse it.
+For files encrypted with a passphrase (`age -p`). Encrypting asks for the passphrase twice; the eye button reveals it. **Generate a strong passphrase** fills in a random one (30 characters, about 148 bits) and shows it, so you can copy it somewhere safe. A passphrase containing a line break (usually from pasting) is refused. The passphrase stays in the fields after a run so the next batch can reuse it.
 
 Inspect may report a passphrase file as "post-quantum". That is correct: passphrase encryption (`scrypt`) uses no public-key cryptography, so there is nothing for a quantum computer to break.
 
-### Recipient tab
+### Keys tab
 
 - **Encrypt to:** public keys, one per line (`age1...`, `age1pq1...`, `ssh-ed25519 ...`, `ssh-rsa ...`). Lines starting with `#` are comments. And/or a recipients file (`-R`). Everyone listed can decrypt the file.
 - **Decrypt with:** identity (secret key) files, one path per line. Unused ones are ignored.
@@ -60,16 +60,17 @@ Output goes next to each source file. Encrypt adds `.age`; decrypt removes it.
 - Existing files are **never overwritten**. If the name is taken, the output becomes `name (1).ext`, `name (2).ext`, ... (`archive (1).tar.gz`, `.gitignore (1)`).
 - While a file is being processed it is written as `name.part` and renamed only when it finished correctly. A failed or cancelled file leaves nothing behind. If the PC crashes mid-file, you find an obvious `.part` file, never a truncated file under the real name.
 - Works on virtual drives such as a mounted Cryptomator vault, and in folders with paths longer than 260 characters.
-- After a run the list is cleared, so pressing the button again can't create duplicate copies.
+- Finished files are not processed again, so pressing the button twice can't create duplicate copies.
 
-**Cancel** appears while a job runs. It stops the current file and deletes its partial output. **Inspect** shows what age-inspect reports about the `.age` files in the list. The **i** button shows the version and links to page's repository and to age.
+**Cancel** appears while a job runs. It stops the current file and deletes its partial output. **Inspect** shows what age-inspect reports about the `.age` files in the list, in a dialog. The **(i)** button shows the version and links to page's repository and to age.
+
+Started as administrator (for example from a search tool that runs elevated), page says so in a dialog and keeps an amber **Admin** pill in the toolbar: Windows then hides drives mapped by your normal account, such as Cryptomator vaults, and blocks drag and drop from Explorer.
 
 ### Options
 
-- **ASCII armor output (-a):** text (PEM) output instead of binary, for pasting into e-mail or chat.
-- **Write log.txt** (off by default): appends a timestamped activity log to `log.txt` next to the program. It never contains the passphrase, but it does list which files you encrypted, which is why it is off by default.
+- **ASCII armor:** text (PEM) output instead of binary, for pasting into e-mail or chat.
 
-Settings (tab, recipients, identity paths, options) are saved in `pageSettings.json` next to the program. Only recipients, comments and paths are saved: secret keys, pasted private keys (PEM blocks), base64 blobs and any other stray text are not. A damaged settings file is kept as `pageSettings.json.bad` (or `.bad (1)`, ...) and reported, instead of being overwritten. If settings or `log.txt` can't be written (for example in a read-only folder), page says so once.
+Settings (tab, recipients, identity paths, options) are saved in `pageSettings.json` next to the program. Only recipients, comments and paths are saved: secret keys, pasted private keys (PEM blocks), base64 blobs and any other stray text are not. A damaged settings file is kept as `pageSettings.json.bad` (or `.bad (1)`, ...) and reported, instead of being overwritten. If settings can't be written (for example in a read-only folder), page says so once.
 
 ## Send to menu
 
@@ -95,7 +96,6 @@ The GUI opens with the selected files in the list (same rules as a drop). Severa
 | `register_context_menu.bat` / `.ps1` | Create the Send to shortcut. |
 | `unregister_context_menu.bat` / `.ps1` | Remove it. |
 | `pageSettings.json` | Created by the GUI. |
-| `log.txt` | Created only when "Write log.txt" is ticked. |
 
 The startup text in the file list says whether the age tools were found.
 

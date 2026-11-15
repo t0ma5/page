@@ -111,41 +111,52 @@ class Secrets(unittest.TestCase):
 
 
 class AdminWarning(unittest.TestCase):
-    def startup_text(self):
-        from types import SimpleNamespace
-
-        fake = SimpleNamespace(age_path=sys.executable, batchpass_path=sys.executable,
-                               keygen_path=sys.executable, inspect_path=sys.executable)
-        return "\n".join(page.AgeGui.startup_status_lines(fake))
-
     def test_exact_wording(self):
         # The owner's wording, word for word.
         self.assertEqual(page.ADMIN_WARNING,
                          "Warning: page is running as administrator. Windows hides drives mapped by your normal "
                          "account from it, also blocks drag & drop from Explorer. Close page and start it normally.")
 
-    def test_not_in_the_box(self):
-        # It's a permanent line above the box, never part of the box text.
-        self.assertNotIn("administrator", self.startup_text())
-
     def test_elevation_check_runs(self):
         self.assertIsInstance(page.running_elevated(), bool)
 
 
-class Bullets(unittest.TestCase):
-    def test_lines_keep_their_indentation(self):
-        got = page.bullet_lines("Drop files here.\n\n  .age files are decrypted.\n      -> out.age\nDone.")
-        self.assertEqual(got, [
-            ("", "Drop files here."),
-            (None, ""),
-            ("  ", ".age files are decrypted."),
-            ("      ", "-> out.age"),
-            ("", "Done."),
-        ])
+class MissingTools(unittest.TestCase):
+    def note(self, **paths):
+        from types import SimpleNamespace
 
-    def test_copy_drops_bullets_keeps_indentation(self):
-        shown = "• Encrypting\n  • [1/2] a.txt\n      • -> a.txt.age\n\n• Done • ok"
-        self.assertEqual(page.strip_bullets(shown), "Encrypting\n  [1/2] a.txt\n      -> a.txt.age\n\nDone • ok")
+        fake = SimpleNamespace(**{k: paths.get(k, sys.executable)
+                                  for k in ("age_path", "batchpass_path", "keygen_path", "inspect_path")})
+        return page.AgeGui.missing_tools_note(fake)
+
+    def test_all_found_says_nothing(self):
+        self.assertEqual(self.note(), "")
+
+    def test_names_what_is_missing(self):
+        text = self.note(keygen_path=os.path.join(tempfile.gettempdir(), "nope", "age-keygen.exe"))
+        self.assertEqual(text, "MISSING age-keygen.exe (needed for key generation)")
+
+
+class ListHelpers(unittest.TestCase):
+    def test_generate_passphrase(self):
+        a, b = page.generate_passphrase(), page.generate_passphrase()
+        self.assertNotEqual(a, b)
+        self.assertRegex(a, r"^[a-z2-9]{5}(-[a-z2-9]{5}){5}$")
+        self.assertNotRegex(a, r"[ilo01]")
+
+    def test_format_size(self):
+        self.assertEqual(page.format_size(None), "")
+        self.assertEqual(page.format_size(5), "5 B")
+        self.assertEqual(page.format_size(1536), "1.5 KB")
+        self.assertEqual(page.format_size(1500 * 1024 * 1024), "1.5 GB")
+        self.assertEqual(page.format_size(300 * 1024 * 1024), "300 MB")
+
+    def test_fit_text_and_folder(self):
+        self.assertEqual(page.fit_text("short.txt", 30), "short.txt")
+        self.assertEqual(page.fit_text("a" * 40, 10), "a" * 9 + "\u2026")
+        if os.name == "nt":
+            self.assertEqual(page.folder_of(r"D:\file.txt"), "D:\\")
+            self.assertEqual(page.folder_of(r"D:\Demo\file.txt"), r"D:\Demo")
 
 
 class AddProblems(unittest.TestCase):

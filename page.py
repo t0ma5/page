@@ -4,6 +4,7 @@ import json
 import os
 import queue
 import re
+import secrets
 import stat
 import subprocess
 import sys
@@ -35,17 +36,18 @@ RECIPIENT_PREFIXES = (
     ("ssh-rsa ", "SSH RSA public key"),
 )
 
-# Colours as (light mode, dark mode).
-MUTED = ("gray40", "gray65")
-# Fits the Recipient tab with a normal bottom margin; the Passphrase tab shares it so
-# switching tabs never moves anything.
-TAB_HEIGHT = 314
+# Colours as (light mode, dark mode). The window is dark, in the Windows 11 style:
+# flat surfaces, hairline dividers, icon buttons. The accent is page's blue.
+MUTED = ("gray40", "gray63")
+ICON_GREY = "#a1a1a1"  # icons are drawn with PIL, which needs hex colours (MUTED's dark value)
 WARN = ("#b35c00", "#f0a040")
 ACCENT = ("#3a7ebf", "#4a9eff")
+OK_COLOR = ("#2f7a43", "#8ac498")
+ERR_COLOR = ("#b3261e", "#ff8a80")
+BLUE, BLUE_HOVER = "#1f6aa5", "#144870"  # the app colour: Files, Folder, the action button
+LINE = ("gray80", "#383838")
+ROW_HOVER = ("gray88", "#2a2a2a")
 DANGER, DANGER_HOVER = "#8b2c2c", "#a33a3a"
-# Mode badge colours: outline + text. Encrypt in the app's blue, decrypt amber.
-ENCRYPT_BADGE = ("#1f6aa5", "#7ab2e6")
-DECRYPT_BADGE = ("#b36b00", "#f0b050")
 APP_NAME = "page"
 APP_VERSION = "0.1.1"
 REPO_URL = "https://github.com/t0ma5/page"
@@ -53,6 +55,9 @@ AGE_URL = "https://github.com/FiloSottile/age"
 
 SECONDARY = {"fg_color": ("gray78", "gray28"), "hover_color": ("gray70", "gray35"),
              "text_color": ("gray10", "gray92"), "text_color_disabled": ("gray55", "gray50")}
+# Flat toolbar / row buttons: only a hover background.
+GHOST = {"fg_color": "transparent", "hover_color": ("gray80", "#3a3a3a"),
+         "text_color": ("gray10", "gray92"), "text_color_disabled": ("gray55", "gray45")}
 
 RECIPIENT_HELP = (
     "Encrypt: needs at least one recipient or a recipients file. A recipient is an age public key "
@@ -86,25 +91,65 @@ ADMIN_WARNING = ("Warning: page is running as administrator. Windows hides drive
                  "from it, also blocks drag & drop from Explorer. Close page and start it normally.")
 
 
-BULLET = "\u2022 "
+PASS_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"  # no look-alikes (i, l, o, 0, 1)
 
 
-def bullet_lines(text):
-    """Split box text into (indent, body) lines. A line keeps its own leading spaces
-    (so nesting shows) and gets a bullet before its text; a blank line is (None, "")."""
-    out = []
-    for raw in text.split("\n"):
-        body = raw.lstrip(" \t").rstrip()
-        if not body:
-            out.append((None, ""))
-        else:
-            out.append((raw[: len(raw) - len(raw.lstrip(" \t"))].replace("\t", "    "), body))
-    return out
+def generate_passphrase():
+    """6 groups of 5 characters from a 31-character alphabet, about 148 bits (same as sage)."""
+    return "-".join("".join(secrets.choice(PASS_ALPHABET) for _ in range(5)) for _ in range(6))
 
 
-def strip_bullets(text):
-    """Box text as it should be copied: indentation kept, bullets removed."""
-    return re.sub(r"(?m)^([ \t]*)\u2022 ", r"\1", text)
+def format_size(n):
+    if n is None:
+        return ""
+    if n < 1024:
+        return f"{n} B"
+    v, unit = n / 1024, "KB"
+    for unit in ("KB", "MB", "GB", "TB"):
+        if v < 1024 or unit == "TB":
+            break
+        v /= 1024
+    return f"{v:.1f} {unit}" if v < 10 else f"{round(v)} {unit}"
+
+
+def fit_text(text, max_chars):
+    """Cut text to max_chars with an ellipsis (Tk labels don't shorten text themselves)."""
+    return text if len(text) <= max_chars else text[: max(1, max_chars - 1)] + "\u2026"
+
+
+def folder_of(path):
+    folder = os.path.dirname(path)
+    return folder + os.sep if re.fullmatch(r"[A-Za-z]:", folder) else folder  # a drive root is "F:\"
+
+
+# Icons from the Windows icon font (Segoe Fluent Icons on Windows 11, Segoe MDL2 Assets
+# on Windows 10), drawn into images so they can sit on buttons next to text.
+GLYPHS = {
+    "add-file": "\ue8e5", "add-folder": "\ue8f4", "trash": "\ue74d", "search": "\ue721",
+    "info": "\ue946", "x": "\ue711", "check": "\ue73e", "error": "\ue783", "folder-open": "\ue838",
+    "eye": "\ue7b3", "file": "\ue8a5", "lock": "\ue72e", "working": "\ue895",
+}
+_icon_font_path = None
+
+
+def glyph_image(name, color, size=16):
+    """A CTkImage of one icon glyph in the given colour, or None if the icon font is missing."""
+    global _icon_font_path
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        if _icon_font_path is None:
+            fonts = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
+            _icon_font_path = next((os.path.join(fonts, f) for f in ("SegoeIcons.ttf", "segmdl2.ttf")
+                                    if os.path.isfile(os.path.join(fonts, f))), "")
+        if not _icon_font_path:
+            return None
+        px = size * 4  # drawn large, shown small: sharp at any scaling
+        font = ImageFont.truetype(_icon_font_path, px)
+        im = Image.new("RGBA", (px, px), (0, 0, 0, 0))
+        ImageDraw.Draw(im).text((px / 2, px / 2), GLYPHS[name], font=font, fill=color, anchor="mm")
+        return ctk.CTkImage(light_image=im, dark_image=im, size=(size, size))
+    except Exception:
+        return None
 
 
 # Bad network path, network name deleted, bad network name, no network.
@@ -352,24 +397,30 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         self.title(f"{APP_NAME} v{APP_VERSION}")
         self.set_window_icon()
 
-        self.files = []
+        # One dict per row in the file list: path, size, status (ready / working / done /
+        # failed), output (the file written) and error. "done" rows stay visible with their
+        # result but are not processed again; "failed" rows are retried by the next run.
+        self.entries = []
+        self.row_widgets = {}
         self.mode = None
+        self.tab = "Passphrase"
         self.is_processing = False
         self.cancel_event = threading.Event()
         self.current_proc = None
         self.worker_thread = None
         self.inflight_output = None
         self.last_summary = None
+        self.notes = ""
+        self.notes_warn = False
+        self.notes_sticky = False  # a note a run doesn't clear (generated passphrase, settings)
+        self.gen_armed = False
         self.ui_queue = queue.Queue()
-        self.write_log = False
-        self.log_error_shown = False
 
         self.base_dir = self.get_base_dir()
         self.age_path = os.path.join(self.base_dir, "age.exe")
         self.batchpass_path = os.path.join(self.base_dir, "age-plugin-batchpass.exe")
         self.keygen_path = os.path.join(self.base_dir, "age-keygen.exe")
         self.inspect_path = os.path.join(self.base_dir, "age-inspect.exe")
-        self.log_path = os.path.join(self.base_dir, "log.txt")
         self.settings_path = os.path.join(self.base_dir, self.SETTINGS_FILE)
 
         # Proportional font for the interface, monospace only where paths and keys are shown.
@@ -387,12 +438,12 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         # the action button keeps its place however small the window gets.
         bottom = ctk.CTkFrame(self, corner_radius=0)
         bottom.pack(side="bottom", fill="x")
-        self.progress = ctk.CTkProgressBar(bottom, height=6)
+        self.progress = ctk.CTkProgressBar(bottom, height=4)
         self.progress.set(0)
-        self.progress.pack(fill="x", padx=20, pady=(12, 0))
+        self.progress.pack(fill="x", padx=16, pady=(10, 0))
         self.reset_progress()
         bar = ctk.CTkFrame(bottom, fg_color="transparent")
-        bar.pack(fill="x", padx=20, pady=(8, 12))
+        bar.pack(fill="x", padx=16, pady=(8, 12))
         bar.grid_columnconfigure(0, weight=1)
         hint_frame = ctk.CTkFrame(bar, fg_color="transparent")
         hint_frame.grid(row=0, column=0, sticky="ew", padx=(0, 12))
@@ -400,134 +451,84 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         self.hint_label.pack(fill="x")
         self.wrap_to_width(self.hint_label, side_padding=0)
         self.cancel_btn = ctk.CTkButton(
-            bar, text="Cancel", width=90, height=40, command=self.cancel, font=font,
+            bar, text="Cancel", width=90, height=38, command=self.cancel, font=font,
             fg_color=DANGER, hover_color=DANGER_HOVER,
         )
         self.cancel_btn.grid(row=0, column=1, padx=(0, 10))
-        self.action_btn = ctk.CTkButton(bar, text="Encrypt", width=200, height=40,
-                                        command=self.run_action, font=(self.ui_font, 15, "bold"))
+        self.action_btn = ctk.CTkButton(bar, text="Encrypt", width=190, height=38, fg_color=BLUE,
+                                        hover_color=BLUE_HOVER, command=self.run_action,
+                                        font=(self.ui_font, 14, "bold"))
         self.action_btn.grid(row=0, column=2)
 
-        options = ctk.CTkFrame(self, fg_color="transparent")
-        options.pack(side="bottom", pady=(8, 12))  # no fill: pack centres it
+        # ---------------- Passphrase / Keys ----------------
+        card = ctk.CTkFrame(self, fg_color="transparent")
+        card.pack(side="bottom", fill="x", padx=20)
+        options = ctk.CTkFrame(card, fg_color="transparent")
+        options.pack(side="bottom", pady=(14, 12))  # no fill: pack centres it
         self.armor_var = ctk.BooleanVar(value=False)
-        self.armor_chk = ctk.CTkCheckBox(
-            options, text="ASCII armor output (-a)", variable=self.armor_var,
-            command=self.save_settings, font=small_font, checkbox_width=20, checkbox_height=20,
-        )
-        self.armor_chk.pack(side="left", padx=(0, 20))
-        self.logfile_var = ctk.BooleanVar(value=False)
-        self.logfile_chk = ctk.CTkCheckBox(
-            options, text="Write log.txt", variable=self.logfile_var,
-            command=self.save_settings, font=small_font, checkbox_width=20, checkbox_height=20,
-        )
-        self.logfile_chk.pack(side="left")
+        self.armor_chk = ctk.CTkSwitch(options, text="ASCII armor   (text output for e-mail or chat)",
+                                       variable=self.armor_var, command=self.save_settings, font=small_font,
+                                       progress_color=BLUE, switch_width=38, switch_height=18)
+        self.armor_chk.pack()
 
-        # ---------------- Files ----------------
-        files_frame = ctk.CTkFrame(self, fg_color="transparent")
-        files_frame.pack(fill="both", expand=True, padx=20, pady=(14, 0))
-        header = ctk.CTkFrame(files_frame, fg_color="transparent")
-        header.pack(fill="x")
-        self.files_title = ctk.CTkLabel(header, text="Files", font=(self.ui_font, 16, "bold"))
-        self.files_title.pack(side="left")
-        # Mode badge: an outline pill (a bordered frame around a label), so it can't be
-        # mistaken for one of the filled buttons. Hidden while the list is empty.
-        self.mode_badge = ctk.CTkFrame(header, fg_color="transparent", border_width=2,
-                                       corner_radius=12, height=24)
-        self.mode_badge_label = ctk.CTkLabel(self.mode_badge, text="", font=(self.ui_font, 12, "bold"),
-                                             fg_color="transparent", height=18)
-        self.mode_badge_label.pack(padx=10, pady=2)
-        self.about_btn = ctk.CTkButton(header, text="i", width=30, height=30, command=self.show_about,
-                                       font=(self.ui_font, 14, "bold"), **SECONDARY)
-        self.about_btn.pack(side="right")
-        self.inspect_btn = ctk.CTkButton(header, text="Inspect", width=80, height=30, command=self.inspect,
-                                         font=small_font, **SECONDARY)
-        self.inspect_btn.pack(side="right", padx=(0, 6))
-        self.clear_btn = ctk.CTkButton(header, text="Clear", width=70, height=30, command=self.clear,
-                                       font=small_font, **SECONDARY)
-        self.clear_btn.pack(side="right", padx=(0, 6))
-        self.add_folder_btn = ctk.CTkButton(header, text="Add folder", width=96, height=30,
-                                            command=self.browse_folder, font=small_font, **SECONDARY)
-        self.add_folder_btn.pack(side="right", padx=(0, 6))
-        self.browse_btn = ctk.CTkButton(header, text="Add files", width=90, height=30, command=self.browse,
-                                        font=small_font)
-        self.browse_btn.pack(side="right", padx=(0, 6))
+        tabs = ctk.CTkFrame(card, fg_color="transparent")
+        tabs.pack(pady=(2, 10))
+        self.tab_buttons = {}
+        for name, label in (("Passphrase", "Passphrase"), ("Recipient", "Keys")):
+            col = ctk.CTkFrame(tabs, fg_color="transparent")
+            col.pack(side="left", padx=11)
+            btn = ctk.CTkButton(col, text=label, width=10, height=28, fg_color="transparent",
+                                hover_color=("gray85", "#2d2d2d"), text_color=MUTED, font=font,
+                                command=lambda n=name: self.set_tab(n))
+            btn.pack()
+            # As wide as the label, like sage's tab underline (about 8.5 px per character at 14 pt).
+            underline = ctk.CTkFrame(col, width=int(len(label) * 8.5) + 6, height=2, corner_radius=0,
+                                     fg_color="transparent")
+            underline.pack()
+            self.tab_buttons[name] = (btn, underline)
+        self.panel_area = ctk.CTkFrame(card, fg_color="transparent")
+        self.panel_area.pack(fill="x")
 
-        # Running as administrator: a warning dialog at start (like About), and an amber
-        # "Admin" pill in the header that reopens it, so a later blocked drag still has
-        # an explanation on screen.
-        self.elevated = running_elevated()
-        if self.elevated:
-            self.admin_chip = ctk.CTkButton(header, text="Admin", width=60, height=24, corner_radius=12,
-                                            border_width=2, border_color=WARN, fg_color="transparent",
-                                            hover_color=("#f6e3cc", "#3a2c1a"), text_color=WARN,
-                                            font=(self.ui_font, 12, "bold"), command=self.show_admin_warning)
-            self.admin_chip.pack(side="left", padx=(10, 0))
-
-        self.drop_border = ctk.ThemeManager.theme["CTkTextbox"]["border_color"]
-        # A small requested height: the box still expands into all free space, but Tk
-        # shrinks the last-packed widget (the tab card) first when space runs short, so a
-        # large request here would squeeze the card instead.
-        self.file_box = ctk.CTkTextbox(files_frame, height=80, font=mono, border_width=2,
-                                       border_color=self.drop_border, wrap="word")
-        self.file_box.pack(fill="both", expand=True, pady=(8, 0))
-        self.file_box.drop_target_register(DND_FILES)
-        self.file_box.dnd_bind("<<Drop>>", self.on_drop)
-        self.file_box.dnd_bind("<<DropEnter>>", lambda e: self.set_drop_highlight(True, e))
-        self.file_box.dnd_bind("<<DropLeave>>", lambda e: self.set_drop_highlight(False, e))
-        # Copy without the bullets; re-measure the hanging indent if the font is rescaled
-        # (e.g. the window moved to a monitor with another scaling).
-        self.file_box._textbox.bind("<<Copy>>", self._copy_box)
-        self.file_box._textbox.bind("<Configure>", lambda e: self._refresh_bullet_tags(), add="+")
-
-        # ---------------- Mode tabs ----------------
-        # Tall enough for the Recipient tab, so switching tabs doesn't resize the file list.
-        self.tabs = ctk.CTkTabview(self, height=TAB_HEIGHT, command=self.on_tab_change)
-        self.tabs.pack(fill="x", padx=20, pady=(8, 0))
-        self.after(50, self.style_tab_buttons)
-        self.tabs.add("Passphrase")
-        self.tabs.add("Recipient")
-        self.tabs.set("Passphrase")
-
-        # Passphrase tab
-        passphrase_tab = self.tabs.tab("Passphrase")
-        self.passphrase_box = ctk.CTkFrame(passphrase_tab, fg_color="transparent")
-        self.passphrase_box.pack(expand=True)
-        ctk.CTkLabel(
-            self.passphrase_box, text="For files encrypted with a passphrase (age -p).",
-            font=small_font, text_color=MUTED,
-        ).pack(pady=(0, 12))
-        self.password = ctk.CTkEntry(self.passphrase_box, placeholder_text="Passphrase", show="*",
-                                     width=360, height=38, font=font)
-        self.password.pack(pady=(0, 8))
+        # Passphrase panel: centred fields, an eye button inside the first one.
+        self.passphrase_box = ctk.CTkFrame(self.panel_area, fg_color="transparent")
+        pw_wrap = ctk.CTkFrame(self.passphrase_box, fg_color="transparent")
+        pw_wrap.pack(pady=(0, 8))
+        self.password = ctk.CTkEntry(pw_wrap, placeholder_text="Passphrase", show="*",
+                                     width=340, height=36, font=font)
+        self.password.pack()
+        # The eye sits on top of the entry, so it takes the entry's own colours.
+        entry_fg = ctk.ThemeManager.theme["CTkEntry"]["fg_color"]
+        self.eye_btn = ctk.CTkButton(pw_wrap, text="", image=self.icon("eye", ICON_GREY), width=30, height=26,
+                                     fg_color=entry_fg, bg_color=entry_fg, hover_color=("gray85", "#4a4d50"),
+                                     command=self.toggle_show_password)
+        self.eye_btn.place(relx=1.0, x=-5, rely=0.5, anchor="e")
         self.confirm = ctk.CTkEntry(self.passphrase_box, placeholder_text="Repeat passphrase", show="*",
-                                    width=360, height=38, font=font)
-        self.confirm.pack(pady=(0, 8))
-        self.show_pw_var = ctk.BooleanVar(value=False)
-        self.show_pw_chk = ctk.CTkCheckBox(
-            self.passphrase_box, text="Show passphrase", variable=self.show_pw_var,
-            command=self.toggle_show_password, font=small_font, checkbox_width=20, checkbox_height=20,
-        )
-        self.show_pw_chk.pack(anchor="w")
+                                    width=340, height=36, font=font)
+        self.confirm.pack(pady=(0, 6))
+        self.gen_btn = ctk.CTkButton(self.passphrase_box, text="Generate a strong passphrase", width=10, height=24,
+                                     fg_color="transparent", hover_color=("gray85", "#2d2d2d"),
+                                     text_color=ACCENT, font=(self.ui_font, 13), command=self.generate_passphrase)
+        self.gen_btn.pack()
         for entry in (self.password, self.confirm):
-            self.bind_input_change(entry, self.update_action_buttons)
+            self.bind_input_change(entry, self.on_passphrase_typed)
             entry.bind("<Return>", lambda _e: self.run_action())
 
-        # Recipient tab
-        recipient_tab = self.tabs.tab("Recipient")
+        # Keys panel
+        recipient_tab = self.recipient_tab = ctk.CTkFrame(self.panel_area, fg_color="transparent")
         row = ctk.CTkFrame(recipient_tab, fg_color="transparent")
-        row.pack(fill="x", padx=6)
+        row.pack(fill="x")
         ctk.CTkLabel(row, text="Encrypt to", font=bold_font).pack(side="left")
         ctk.CTkLabel(row, text="public keys, one per line \u00b7 # comment",
                      font=small_font, text_color=MUTED).pack(side="left", padx=8)
-        ctk.CTkButton(row, text="?", width=28, height=26, command=self.show_help, font=bold_font,
-                      **SECONDARY).pack(side="right")
+        self.help_btn = ctk.CTkButton(row, text="?", width=28, height=26, command=self.show_help,
+                                      font=bold_font, **GHOST)
+        self.help_btn.pack(side="right")
         self.recipient_box = ctk.CTkTextbox(recipient_tab, height=52, font=mono, wrap="none")
-        self.recipient_box.pack(fill="x", padx=6, pady=(4, 6))
+        self.recipient_box.pack(fill="x", pady=(4, 6))
         self.bind_input_change(self.recipient_box, self.on_recipient_inputs_changed)
 
         rf_frame = ctk.CTkFrame(recipient_tab, fg_color="transparent")
-        rf_frame.pack(fill="x", padx=6)
+        rf_frame.pack(fill="x")
         rf_frame.grid_columnconfigure(0, weight=1)
         self.recipients_file = ctk.CTkEntry(rf_frame, placeholder_text="...and/or a recipients file (-R)",
                                             height=32, font=mono)
@@ -538,7 +539,7 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         self.recipients_file_btn.grid(row=0, column=1)
 
         row = ctk.CTkFrame(recipient_tab, fg_color="transparent")
-        row.pack(fill="x", padx=6, pady=(12, 0))
+        row.pack(fill="x", pady=(10, 0))
         ctk.CTkLabel(row, text="Decrypt with", font=bold_font).pack(side="left")
         ctk.CTkLabel(row, text="identity (secret key) files, one path per line",
                      font=small_font, text_color=MUTED).pack(side="left", padx=8)
@@ -546,23 +547,97 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
                                                command=self.browse_identity_file, font=small_font, **SECONDARY)
         self.identity_file_btn.pack(side="right")
         self.identity_box = ctk.CTkTextbox(recipient_tab, height=52, font=mono, wrap="none")
-        self.identity_box.pack(fill="x", padx=6, pady=(4, 8))
+        self.identity_box.pack(fill="x", pady=(4, 8))
         self.bind_input_change(self.identity_box, self.on_recipient_inputs_changed)
 
         keygen_frame = ctk.CTkFrame(recipient_tab, fg_color="transparent")
-        keygen_frame.pack(fill="x", padx=6)
+        keygen_frame.pack(fill="x")
         self.keygen_btn = ctk.CTkButton(keygen_frame, text="Generate new key pair", height=30,
                                         command=self.generate_key, font=small_font, **SECONDARY)
         self.keygen_btn.pack(side="left")
         self.pq_var = ctk.BooleanVar(value=False)
-        self.pq_chk = ctk.CTkCheckBox(keygen_frame, text="Post-quantum (-pq)", variable=self.pq_var,
-                                      command=self.save_settings, font=small_font,
-                                      checkbox_width=20, checkbox_height=20)
-        self.pq_chk.pack(side="left", padx=12)
+        self.pq_chk = ctk.CTkSwitch(keygen_frame, text="Post-quantum", variable=self.pq_var,
+                                    command=self.save_settings, font=small_font, progress_color=BLUE,
+                                    switch_width=38, switch_height=18)
+        self.pq_chk.pack(side="left", padx=14)
 
+        # ---------------- Toolbar ----------------
+        toolbar = ctk.CTkFrame(self, fg_color="transparent")
+        toolbar.pack(side="top", fill="x", padx=12, pady=(8, 0))
+        white = "#ffffff"
+        self.browse_btn = ctk.CTkButton(toolbar, text="Files", image=self.icon("add-file", white), compound="left",
+                                        width=88, height=32, fg_color=BLUE, hover_color=BLUE_HOVER,
+                                        font=small_font, command=self.browse)
+        self.browse_btn.pack(side="left", padx=(0, 6))
+        self.add_folder_btn = ctk.CTkButton(toolbar, text="Folder", image=self.icon("add-folder", white),
+                                            compound="left", width=96, height=32, fg_color=BLUE,
+                                            hover_color=BLUE_HOVER, font=small_font, command=self.browse_folder)
+        self.add_folder_btn.pack(side="left")
+        ctk.CTkFrame(toolbar, width=1, height=22, fg_color=LINE).pack(side="left", padx=10)
+        text_hex = "#ebebeb"
+        self.clear_btn = ctk.CTkButton(toolbar, text="Clear", image=self.icon("trash", text_hex), compound="left",
+                                       width=80, height=32, command=self.clear, font=small_font, **GHOST)
+        self.clear_btn.pack(side="left")
+        self.inspect_btn = ctk.CTkButton(toolbar, text="Inspect", image=self.icon("search", text_hex),
+                                         compound="left", width=88, height=32, command=self.inspect,
+                                         font=small_font, **GHOST)
+        self.inspect_btn.pack(side="left", padx=(2, 0))
+        self.about_btn = ctk.CTkButton(toolbar, text="", image=self.icon("info", text_hex), width=32, height=32,
+                                       command=self.show_about, **GHOST)
+        self.about_btn.pack(side="right")
+
+        # Running as administrator: a warning dialog at start (like About), and an amber
+        # "Admin" pill in the toolbar that reopens it, so a later blocked drag still has
+        # an explanation on screen.
+        self.elevated = running_elevated()
+        if self.elevated:
+            self.admin_chip = ctk.CTkButton(toolbar, text="Admin", width=60, height=24, corner_radius=12,
+                                            border_width=2, border_color=WARN, fg_color="transparent",
+                                            hover_color=("#f6e3cc", "#3a2c1a"), text_color=WARN,
+                                            font=(self.ui_font, 12, "bold"), command=self.show_admin_warning)
+            self.admin_chip.pack(side="right", padx=(0, 8))
+        ctk.CTkFrame(self, height=1, corner_radius=0, fg_color=LINE).pack(side="top", fill="x", pady=(8, 0))
+
+        # ---------------- File list ----------------
+        files_frame = ctk.CTkFrame(self, fg_color="transparent")
+        files_frame.pack(side="top", fill="both", expand=True, padx=12)
+        head = ctk.CTkFrame(files_frame, fg_color="transparent", height=30)
+        head.pack(fill="x")
+        self.configure_row_grid(head)
+        for col, text in ((1, "Name"), (2, "Folder"), (3, "Size")):
+            lbl = ctk.CTkLabel(head, text=text, font=(self.ui_font, 12), text_color=MUTED,
+                               anchor="e" if col == 3 else "w")
+            lbl.grid(row=0, column=col, sticky="ew", padx=(0, 8) if col == 3 else 0, pady=2)
+            if col == 2:
+                self.col_second = lbl
+        ctk.CTkFrame(files_frame, height=1, corner_radius=0, fg_color=LINE).pack(fill="x")
+        # The lines under the list are packed (from the bottom up) before the list itself:
+        # Tk squeezes the last-packed widget first, and that must be the list, not them.
+        self.notes_label = ctk.CTkLabel(files_frame, text="", anchor="w", justify="left",
+                                        font=(self.ui_font, 12), text_color=MUTED)
+        self.notes_label.pack(side="bottom", fill="x", padx=8, pady=(0, 14))
+        self.summary_label = ctk.CTkLabel(files_frame, text="", anchor="w", justify="left",
+                                          font=(self.ui_font, 12), text_color=MUTED)
+        self.summary_label.pack(side="bottom", fill="x", padx=8, pady=(6, 0))
+        ctk.CTkFrame(files_frame, height=1, corner_radius=0, fg_color=LINE).pack(side="bottom", fill="x")
+        self.list_frame = ctk.CTkScrollableFrame(files_frame, fg_color="transparent", corner_radius=0, height=80)
+        self.list_frame.pack(fill="both", expand=True)
+        self.list_frame.grid_columnconfigure(0, weight=1)
+        for label in (self.summary_label, self.notes_label):
+            self.wrap_to_width(label, side_padding=16)
+
+        # Files can be dropped anywhere on the window.
+        self.drop_target_register(DND_FILES)
+        self.dnd_bind("<<Drop>>", self.on_drop)
+        self.dnd_bind("<<DropEnter>>", lambda e: self.set_drop_highlight(True, e))
+        self.dnd_bind("<<DropLeave>>", lambda e: self.set_drop_highlight(False, e))
 
         self.load_settings()
-        self.show_welcome()
+        missing = self.missing_tools_note()
+        if missing:
+            self.set_notes(missing, warn=True, sticky=True)
+        self.set_tab(self.tab, save=False)
+        self.render_list()
         self.set_initial_geometry()
         self.update_mode_and_input_visibility()
         self.update_action_buttons()
@@ -602,18 +677,22 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
 
         container.bind("<Configure>", on_configure, add="+")
 
-    def style_tab_buttons(self):
-        try:
-            segmented = getattr(self.tabs, "_segmented_button", None)
-            if segmented is not None:
-                segmented.configure(font=(self.ui_font, self.ui_font_size))
-                for btn in getattr(segmented, "_buttons_dict", {}).values():
-                    try:
-                        btn.configure(width=140, font=(self.ui_font, self.ui_font_size))
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+    def icon(self, name, color, size=16):
+        """An icon image (cached), or None if the icon font isn't there."""
+        key = (name, color, size)
+        cache = self.__dict__.setdefault("_icons", {})
+        if key not in cache:
+            cache[key] = glyph_image(name, color, size)
+        return cache[key]
+
+    @staticmethod
+    def configure_row_grid(frame):
+        """The file list's columns: icon, name, folder or result, size, buttons."""
+        frame.grid_columnconfigure(0, minsize=30)
+        frame.grid_columnconfigure(1, weight=1)
+        frame.grid_columnconfigure(2, minsize=160)
+        frame.grid_columnconfigure(3, minsize=64)
+        frame.grid_columnconfigure(4, minsize=66)
 
     def usable_screen(self):
         """(x, y, width, height) of the screen area not covered by the taskbar, in physical pixels."""
@@ -643,9 +722,9 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
             scaling = 1.0
         sx, sy, sw, sh = self.usable_screen()
         title_bar = int(40 * scaling)
-        # Same size as sage (590 x 660), so the two apps look alike.
+        # Same size as sage (590 x 720), so the two apps look alike.
         width = min(590, int(sw / scaling) - 20)
-        height = min(660, int((sh - title_bar) / scaling) - 10)
+        height = min(720, int((sh - title_bar) / scaling) - 10)
         self.minsize(min(520, width), min(540, height))
         x = sx + max(0, (sw - int(width * scaling)) // 2)
         y = sy + max(0, (sh - int(height * scaling) - title_bar) // 2)
@@ -692,12 +771,18 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         return os.path.dirname(os.path.abspath(__file__))
 
     def active_mode_kind(self):
-        return "recipient" if self.tabs.get() == "Recipient" else "passphrase"
+        return "recipient" if self.tab == "Recipient" else "passphrase"
 
-    def toggle_show_password(self):
-        show = "" if self.show_pw_var.get() else "*"
-        self.password.configure(show=show)
-        self.confirm.configure(show=show)
+    def toggle_show_password(self, show=None):
+        if show is None:
+            show = self.password.cget("show") != ""
+        for entry in (self.password, self.confirm):
+            entry.configure(show="" if show else "*")
+        self.eye_btn.configure(image=self.icon("eye", ACCENT[1] if show else ICON_GREY))
+
+    def pending_files(self):
+        """The files the next run will process (finished rows are not run again)."""
+        return [e["path"] for e in self.entries if e["status"] != "done"]
 
     def parse_multiline_lines(self, widget):
         lines = []
@@ -824,17 +909,12 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         self.save_settings()
         self.update_action_buttons()
 
-    # ------------------------------------------------------------------ logging
+    # ------------------------------------------------------------------ file list
 
-    def startup_status_lines(self):
-        lines = [
-            "Drop files or folders here.",
-            "",
-            "  .age files are decrypted, everything else is encrypted.",
-            "  Output goes next to each file; existing files are never overwritten.",
-        ]
+    def missing_tools_note(self):
+        """Which age tools are missing next to page, or "" when all are there."""
         missing = [
-            f"  MISSING {os.path.basename(path)} ({need})"
+            f"MISSING {os.path.basename(path)} ({need})"
             for path, need in (
                 (self.age_path, "required"),
                 (self.batchpass_path, "needed for the Passphrase tab"),
@@ -843,101 +923,154 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
             )
             if not os.path.isfile(path)
         ]
-        lines += missing or ["  age tools: all found."]
-        notice = getattr(self, "settings_notice", None)
-        if notice:
-            lines += ["", "  " + notice]
-        return lines
+        return "\n".join(missing)
 
-    def show_welcome(self):
-        self._write_box("\n".join(self.startup_status_lines()), clear_first=True)
-
-    def append_to_log_file(self, text):
-        if not self.write_log:  # plain bool: Tk variables must not be read from worker threads
+    def render_list(self):
+        """Rebuild every row (rows are few; results update single rows, see update_row)."""
+        for child in self.list_frame.winfo_children():
+            child.destroy()
+        self.row_widgets = {}
+        self.update_column_header()
+        if not self.entries:
+            empty = ctk.CTkFrame(self.list_frame, fg_color="transparent")
+            empty.grid(row=0, column=0, sticky="nsew", pady=(30, 10))
+            image = self.icon("add-file", ACCENT[1], 30)
+            ctk.CTkLabel(empty, text="", image=image).pack()
+            ctk.CTkLabel(empty, text="Drop files or folders here", font=(self.ui_font, 14, "bold")).pack(pady=(6, 2))
+            for line in (".age files are decrypted, everything else is encrypted.",
+                         "Output goes next to each file; existing files are never overwritten."):
+                ctk.CTkLabel(empty, text=line, font=(self.ui_font, 13), text_color=MUTED).pack()
             return
-        try:
-            stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            with open(self.log_path, "a", encoding="utf-8") as log_file:
-                log_file.write(f"[{stamp}] {text}\n")
-        except Exception as exc:
-            # Say once that log.txt can't be written, instead of failing silently.
-            # Queued, because this can run on the worker thread.
-            if not self.log_error_shown:
-                self.log_error_shown = True
-                self.ui_queue.put(("log", f"(log.txt can't be written next to page: {exc})", False))
+        for i, entry in enumerate(self.entries):
+            self.build_row(entry, i)
 
-    def _write_box(self, text, clear_first=False, plain=False):
-        """Each line gets a bullet after its own indentation, with wrapped text indented
-        under the first word. plain=True writes the text as it is (tool output such as
-        age-inspect's, which has its own layout)."""
-        # The box is read-only for the user; unlock it only while writing.
-        self._refresh_bullet_tags()  # cheap: re-measures only if the font changed
-        self.file_box.configure(state="normal")
-        if clear_first:
-            self.file_box.delete("0.0", "end")
-        if plain:
-            self.file_box.insert("end", text + "\n")
+    def build_row(self, entry, index):
+        status = entry["status"]
+        row = ctk.CTkFrame(self.list_frame, fg_color="transparent", corner_radius=4, height=34)
+        row.grid(row=index * 2, column=0, sticky="ew")
+        self.configure_row_grid(row)
+        name = os.path.basename(entry["path"])
+        icon_name, icon_color = {
+            "done": ("check", OK_COLOR[1]), "failed": ("error", ERR_COLOR[1]), "working": ("working", ACCENT[1]),
+        }.get(status, ("lock" if entry["path"].lower().endswith(".age") else "file", ICON_GREY))
+        ctk.CTkLabel(row, text="", image=self.icon(icon_name, icon_color), width=24).grid(row=0, column=0, padx=(6, 0))
+        ctk.CTkLabel(row, text=fit_text(name, 30), font=(self.ui_font, 13), anchor="w").grid(
+            row=0, column=1, sticky="ew", padx=(4, 6))
+        if status == "done":
+            detail, color = "\u2192 " + os.path.basename(entry.get("output") or ""), MUTED
+        elif status == "failed":
+            detail, color = entry.get("error") or "Failed", ERR_COLOR
         else:
-            for indent, body in bullet_lines(text):
-                if indent is None:
-                    self.file_box.insert("end", "\n")
-                else:
-                    self.file_box.insert("end", indent + BULLET + body + "\n", self._bullet_tag(len(indent)))
-        self.file_box.see("end")
-        self.file_box.configure(state="disabled")
+            detail, color = folder_of(entry["path"]), MUTED
+        ctk.CTkLabel(row, text=fit_text(detail, 22), font=(self.ui_font, 13), text_color=color, anchor="w").grid(
+            row=0, column=2, sticky="ew")
+        ctk.CTkLabel(row, text=format_size(entry.get("size")), font=(self.ui_font, 13), text_color=MUTED,
+                     anchor="e").grid(row=0, column=3, sticky="ew", padx=(0, 8))
+        actions = ctk.CTkFrame(row, fg_color="transparent")
+        actions.grid(row=0, column=4, sticky="e", padx=(0, 4))
+        if status == "done":
+            ctk.CTkButton(actions, text="", image=self.icon("folder-open", ICON_GREY), width=28, height=28,
+                          command=lambda e=entry: self.show_in_folder(e), **GHOST).pack(side="left")
+        ctk.CTkButton(actions, text="", image=self.icon("x", ICON_GREY, 12), width=28, height=28,
+                      state="disabled" if self.is_processing else "normal",
+                      command=lambda e=entry: self.remove_entry(e), **GHOST).pack(side="left", padx=(2, 0))
+        line = ctk.CTkFrame(self.list_frame, height=1, corner_radius=0, fg_color=LINE)
+        line.grid(row=index * 2 + 1, column=0, sticky="ew")
+        # Row hover, like a list in Explorer.
+        widgets = [row] + list(row.winfo_children())
+        for w in widgets:
+            w.bind("<Enter>", lambda _e, r=row: r.configure(fg_color=ROW_HOVER), add="+")
+            w.bind("<Leave>", lambda _e, r=row: r.configure(fg_color="transparent"), add="+")
+        self.row_widgets[id(entry)] = (row, line)
 
-    def _bullet_tag(self, indent):
-        """The tag for a line with this many leading spaces: wrapped text lines up after the bullet."""
-        self._bullet_tags = getattr(self, "_bullet_tags", set())
-        tag = f"bullet{indent}"
-        if tag not in self._bullet_tags:
-            self._bullet_tags.add(tag)
-            self._refresh_bullet_tags(force=True)
-        return tag
+    def update_row(self, entry):
+        """Redraw one row in place (a file's result or progress)."""
+        old = self.row_widgets.get(id(entry))
+        if not old or entry not in self.entries:
+            return self.render_list()
+        for w in old:
+            w.destroy()
+        self.build_row(entry, self.entries.index(entry))
+        self.update_column_header()
 
-    def _refresh_bullet_tags(self, force=False):
-        """(Re)measure the hanging indents, when a tag is new or the font has changed."""
-        font_spec = str(self.file_box._textbox.cget("font"))
-        if not force and font_spec == getattr(self, "_bullet_font", None):
+    def update_column_header(self):
+        # After a run the second column shows each file's result instead of its folder.
+        ran = sum(1 for e in self.entries if e["status"] in ("done", "failed"))
+        self.col_second.configure(text="Folder" if ran == 0 else "Result" if ran == len(self.entries)
+                                  else "Folder / result")
+
+    def remove_entry(self, entry):
+        if self.is_processing:
             return
-        self._bullet_font = font_spec
-        font = tkfont.Font(font=font_spec)
-        for tag in getattr(self, "_bullet_tags", set()):
-            indent = int(tag[len("bullet"):])
-            self.file_box.tag_config(tag, lmargin1=0, lmargin2=font.measure(" " * indent + BULLET))
+        self.entries = [e for e in self.entries if e is not entry]
+        if not any(e["status"] in ("done", "failed") for e in self.entries):
+            self.last_summary = None
+        self.update_mode_from_files()
+        self.render_list()
+        self.update_mode_and_input_visibility()
+        self.update_action_buttons()
 
-    def _copy_box(self, _event=None):
-        """Copy the selection with its indentation but without the bullets."""
-        try:
-            text = self.file_box._textbox.get("sel.first", "sel.last")
-        except TclError:
-            return "break"  # nothing selected
-        self.clipboard_clear()
-        self.clipboard_append(strip_bullets(text))
-        return "break"
+    def show_in_folder(self, entry):
+        """Show the written file in Explorer, selected."""
+        path = entry.get("output") or ""
+        if not os.path.isfile(long_path(path)):
+            self.set_notes(f"{os.path.basename(path)} isn't there any more.", warn=True)
+            return
+        windir = os.environ.get("SystemRoot", r"C:\Windows")
+        # Explorer parses its own command line: the path must be quoted even without
+        # spaces, or a comma in it splits it; and it doesn't take \\?\ paths.
+        subprocess.Popen(f'"{os.path.join(windir, "explorer.exe")}" /select,"{without_long_prefix(path)}"')
 
-    def log_to_box(self, text, clear_first=False, plain=False):
-        """Thread-safe: Tk widgets are only touched from the main thread."""
-        if threading.current_thread() is threading.main_thread():
-            self._write_box(text, clear_first, plain)
+    def set_notes(self, text, warn=False, sticky=False):
+        self.notes, self.notes_warn, self.notes_sticky = text, warn, sticky
+        self.render_summary()
+
+    def render_summary(self):
+        todo = self.pending_files()
+        if self.last_summary:
+            line = self.last_summary
+        elif todo:
+            size = sum(e.get("size") or 0 for e in self.entries if e["status"] != "done")
+            verb = "decrypted" if self.mode == "decrypt" else "encrypted"
+            line = f"{len(todo)} file{'' if len(todo) == 1 else 's'} will be {verb} \u00b7 {format_size(size)}"
         else:
-            self.ui_queue.put(("log", text, clear_first, plain))
-        self.append_to_log_file(text)
+            line = ""
+        self.summary_label.configure(text=line)
+        self.summary_label.pack_configure(pady=(6, 0) if line else (0, 0))
+        # At most 4 lines, so a long "Not added" list can't squeeze the file list.
+        lines = self.notes.splitlines()
+        text = "\n".join(lines[:4] + ([f"...and {len(lines) - 4} more lines."] if len(lines) > 4 else []))
+        self.notes_label.configure(text=text, text_color=WARN if self.notes_warn else MUTED)
 
     def process_ui_queue(self):
         try:
             while True:
                 item = self.ui_queue.get_nowait()
                 try:
-                    if item[0] == "log":
-                        self._write_box(item[1], item[2], item[3] if len(item) > 3 else False)
-                    elif item[0] == "progress":
-                        done, total = item[1], item[2]
+                    kind = item[0]
+                    if kind == "current":
+                        entry = self.find_entry(item[1])
+                        if entry is not None and entry["status"] == "ready":
+                            for e in self.entries:
+                                if e["status"] == "working":
+                                    e["status"] = "ready"
+                                    self.update_row(e)
+                            entry["status"] = "working"
+                            self.update_row(entry)
+                    elif kind == "result":
+                        self.apply_result(*item[1:])
+                    elif kind == "progress":
+                        done, total, name = item[1], item[2], item[3]
                         self.progress.set(done / total if total else 0)
-                        self.hint_label.configure(text=f"Working on file {min(done + 1, total)} of {total}...",
-                                                  text_color=MUTED)
-                    elif item[0] == "done":
-                        self.finish_job(clear_files=item[1], summary=item[2])
+                        if name:
+                            self.hint_label.configure(text=f"Working on file {min(done + 1, total)} of {total}: {name}",
+                                                      text_color=MUTED)
+                    elif kind == "info":
+                        self.show_info(item[1], item[2])
+                    elif kind == "notes":
+                        self.set_notes(item[1], warn=item[2])
+                    elif kind == "done":
+                        self.finish_job(summary=item[1])
                 except Exception as exc:
                     print(f"UI update failed: {exc!r}", file=sys.stderr)
         except queue.Empty:
@@ -946,18 +1079,33 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
             # Always reschedule: if this loop died, the UI would stay locked forever.
             self.after(50, self.process_ui_queue)
 
-    def finish_job(self, clear_files, summary=None):
+    def find_entry(self, path):
+        return next((e for e in self.entries if e["path"] == path), None)
+
+    def apply_result(self, path, ok, output, error, cancelled):
+        entry = self.find_entry(path)
+        if entry is None:
+            return
+        if ok:
+            entry.update(status="done", output=output, error=None)
+        elif cancelled:
+            entry.update(status="ready", error=None)  # nothing happened to it; the next run does it
+        else:
+            entry.update(status="failed", error=error)
+        self.update_row(entry)
+
+    def finish_job(self, summary=None):
         self.is_processing = False
         self.current_proc = None
         self.worker_thread = None
-        if clear_files:
-            # Prevents a second ENCRYPT/Enter from quietly re-processing everything
-            # into "name (1).ext.age" copies.
-            self.files = []
-            self.mode = None
-            self.update_mode_and_input_visibility()
+        for e in self.entries:
+            if e["status"] == "working":
+                e["status"] = "ready"
         if summary:
             self.last_summary = summary
+        self.update_mode_from_files()
+        self.render_list()
+        self.update_mode_and_input_visibility()
         self.update_action_buttons()
 
     # ------------------------------------------------------------------ settings
@@ -984,12 +1132,12 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
                 except OSError:
                     break
             if bad:
-                self.settings_notice = (f"The settings file was damaged and was not loaded "
-                                        f"(kept as {os.path.basename(bad)}).")
+                notice = f"The settings file was damaged and was not loaded (kept as {os.path.basename(bad)})."
             else:
                 self.settings_broken = True  # can't move it aside: don't save over it
-                self.settings_notice = ("The settings file is damaged and could not be moved aside, "
-                                        "so settings will not be saved until it is fixed or deleted.")
+                notice = ("The settings file is damaged and could not be moved aside, "
+                          "so settings will not be saved until it is fixed or deleted.")
+            self.after(0, lambda: self.set_notes(notice, warn=True, sticky=True))
             return
 
         def text(key):
@@ -997,12 +1145,7 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
             return value.strip() if isinstance(value, str) else ""
 
         if data.get("active_tab") in ("Passphrase", "Recipient"):
-            target = data["active_tab"]
-            self.tabs.set(target)
-            # CTkTabview.set() hides all other tabs 100 ms later. The set("Passphrase")
-            # made while building the window would then hide this tab as well, leaving
-            # the card empty. Select it again after those delayed hides have run.
-            self.after(150, lambda: self.tabs.set(target))
+            self.tab = data["active_tab"]
 
         recipients_text = text("recipient_box")
         identities_text = text("identity_box")
@@ -1014,23 +1157,19 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         if recipients_file:
             self.recipients_file.insert(0, recipients_file)
         self.armor_var.set(bool(data.get("armor", False)))
-        self.logfile_var.set(bool(data.get("write_log", False)))
-        self.write_log = self.logfile_var.get()
         self.pq_var.set(bool(data.get("pq", False)))
 
     def save_settings(self):
-        self.write_log = self.logfile_var.get()
         if getattr(self, "settings_broken", False):
             return
         # The textboxes are saved so comment lines (# Alice) survive restarts, but never
         # secret keys, PEM blocks or base64 blobs (see without_secrets).
         data = {
-            "active_tab": self.tabs.get(),
+            "active_tab": self.tab,
             "recipient_box": keep_lines(self.recipient_box.get("0.0", "end"), self.classify_recipient),
             "recipients_file": keep_lines(self.recipients_file.get(), looks_like_path),
             "identity_box": keep_lines(self.identity_box.get("0.0", "end"), looks_like_path),
             "armor": self.armor_var.get(),
-            "write_log": self.logfile_var.get(),
             "pq": self.pq_var.get(),
         }
         # Write to a temp file and swap it in, so a crash mid-write can't wipe the settings.
@@ -1047,34 +1186,37 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
             # #9: say once that settings can't be saved, instead of failing silently.
             if not getattr(self, "settings_error_shown", False):
                 self.settings_error_shown = True
-                self._write_box(f"Settings can't be saved next to page: {exc}")
+                self.set_notes(f"Settings can't be saved next to page: {exc}", warn=True, sticky=True)
 
     # ------------------------------------------------------------------ UI state
 
-    def on_tab_change(self):
-        self.save_settings()
-        self.style_tab_buttons()
+    def set_tab(self, name, save=True):
+        self.tab = name
+        for tab_name, (btn, underline) in self.tab_buttons.items():
+            on = tab_name == name
+            btn.configure(text_color=("gray10", "gray95") if on else MUTED,
+                          font=(self.ui_font, 14, "bold") if on else (self.ui_font, 14))
+            underline.configure(fg_color=BLUE if on else "transparent")
+        if name == "Passphrase":
+            self.recipient_tab.pack_forget()
+            self.passphrase_box.pack()
+        else:
+            self.passphrase_box.pack_forget()
+            self.recipient_tab.pack(fill="x")
+        if save:
+            self.save_settings()
         self.update_mode_and_input_visibility()
         self.update_action_buttons()
 
     def update_mode_and_input_visibility(self):
-        if self.active_mode_kind() == "passphrase" and self.mode != "decrypt":
-            self.confirm.pack(pady=(0, 8), after=self.password)
+        encrypting = self.mode != "decrypt"
+        if encrypting:
+            self.confirm.pack(pady=(0, 6), after=self.password.master)
+            self.gen_btn.pack(after=self.confirm)
         else:
             self.confirm.pack_forget()
-        self.armor_chk.configure(state="disabled" if self.mode == "decrypt" else "normal")
-
-    def update_mode_badge(self):
-        if not self.files:
-            self.mode_badge.pack_forget()
-            return
-        n = len(self.files)
-        colour = DECRYPT_BADGE if self.mode == "decrypt" else ENCRYPT_BADGE
-        word = "DECRYPT" if self.mode == "decrypt" else "ENCRYPT"
-        self.mode_badge.configure(border_color=colour)
-        self.mode_badge_label.configure(text=f"{word} · {n}", text_color=colour)
-        if not self.mode_badge.winfo_ismapped():
-            self.mode_badge.pack(side="left", padx=10, after=self.files_title)
+            self.gen_btn.pack_forget()
+        self.armor_chk.configure(state="normal" if encrypting and not self.is_processing else "disabled")
 
     def compute_action(self):
         """(enabled, button text, hint, is_warning) for the main action button.
@@ -1083,16 +1225,19 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         """
         if not os.path.isfile(self.age_path):
             return False, "Encrypt", "age.exe was not found next to this program.", True
-        if not self.files:
-            return False, "Encrypt", "Drop files or folders above, or click Add files.", False
-        n = len(self.files)
+        files = self.pending_files()
+        if not files:
+            if self.entries:
+                return False, "Encrypt", "All done. Add more files, or Clear to start over.", False
+            return False, "Encrypt", "Drop files or folders above, or click Files.", False
+        n = len(files)
         verb = "Decrypt" if self.mode == "decrypt" else "Encrypt"
         text = f"{verb} {n} file" + ("" if n == 1 else "s")
         ready = "Ready. Output goes next to each file; existing files are never overwritten."
 
         if self.active_mode_kind() == "passphrase":
             if not os.path.isfile(self.batchpass_path):
-                return False, text, "age-plugin-batchpass.exe not found. Use the Recipient tab.", True
+                return False, text, "age-plugin-batchpass.exe not found. Use the Keys tab.", True
             pw = self.password.get()
             if not pw:
                 return False, text, "Enter the passphrase.", False
@@ -1115,17 +1260,17 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         busy = self.is_processing
         idle_state = "disabled" if busy else "normal"
         for w in (self.browse_btn, self.add_folder_btn, self.clear_btn, self.password, self.confirm,
-                  self.show_pw_chk, self.recipient_box, self.recipients_file, self.recipients_file_btn,
-                  self.identity_box, self.identity_file_btn, self.armor_chk, self.pq_chk, self.logfile_chk):
+                  self.eye_btn, self.gen_btn, self.recipient_box, self.recipients_file, self.recipients_file_btn,
+                  self.identity_box, self.identity_file_btn, self.pq_chk, self.help_btn,
+                  *(btn for btn, _ in self.tab_buttons.values())):
             w.configure(state=idle_state)
-        has_age_files = any(f.lower().endswith(".age") for f in self.files)
+        has_age_files = any(e["path"].lower().endswith(".age") for e in self.entries)
         self.inspect_btn.configure(
             state="normal" if (not busy and has_age_files and os.path.isfile(self.inspect_path)) else "disabled"
         )
         self.keygen_btn.configure(state="normal" if (not busy and os.path.isfile(self.keygen_path)) else "disabled")
-        if self.mode == "decrypt":
-            self.armor_chk.configure(state="disabled")
-        self.update_mode_badge()
+        self.armor_chk.configure(state="normal" if not busy and self.mode != "decrypt" else "disabled")
+        self.render_summary()
 
         if busy:
             self.cancel_btn.grid()
@@ -1133,8 +1278,6 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
             return
         self.cancel_btn.grid_remove()
         enabled, text, hint, warn = self.compute_action()
-        if self.last_summary:
-            hint = f"{self.last_summary} {hint}"
         self.action_btn.configure(state="normal" if enabled else "disabled", text=text)
         self.hint_label.configure(text=hint, text_color=WARN if warn else MUTED)
 
@@ -1147,8 +1290,50 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
             self.encrypt()
 
     def set_drop_highlight(self, on, event=None):
-        self.file_box.configure(border_color=ACCENT if on else self.drop_border)
+        self.list_frame.configure(fg_color=("gray90", "#262c33") if on else "transparent")
         return event.action if event is not None else None
+
+    def on_passphrase_typed(self):
+        self.gen_armed = False
+        self.update_action_buttons()
+
+    def generate_passphrase(self):
+        """Fill both fields with a random passphrase; a typed one is only replaced on a second click."""
+        if self.is_processing:
+            return
+        if self.password.get() and not self.gen_armed:
+            self.gen_armed = True
+            self.set_notes("Click again to replace the passphrase you typed with a generated one.", warn=True)
+            return
+        self.gen_armed = False
+        p = generate_passphrase()
+        for entry in (self.password, self.confirm):
+            entry.delete(0, "end")
+            entry.insert(0, p)
+        self.toggle_show_password(True)
+        self.set_notes("Generated a passphrase. Copy it and keep it somewhere safe: without it the files "
+                       "can't be decrypted.", warn=True, sticky=True)
+        self.update_action_buttons()
+
+    def show_info(self, title, text):
+        """Longer messages (Inspect, key generation) in a dialog like About."""
+        win = ctk.CTkToplevel(self)
+        win.title(title)
+        win.transient(self)
+        body = ctk.CTkFrame(win, fg_color="transparent")
+        body.pack(padx=20, pady=16, fill="both", expand=True)
+        ctk.CTkLabel(body, text=title, font=(self.ui_font, 16, "bold"), anchor="w").pack(fill="x")
+        box = ctk.CTkTextbox(body, width=460, height=min(300, 40 + 18 * text.count("\n")),
+                             font=(self.mono_font, 13), wrap="word")
+        box.pack(fill="both", expand=True, pady=(8, 12))
+        box.insert("0.0", text)
+        box.configure(state="disabled")
+        close = ctk.CTkButton(body, text="Close", width=100, height=32, command=win.destroy,
+                              font=self.small_font, fg_color=BLUE, hover_color=BLUE_HOVER)
+        close.pack(anchor="e")
+        win.bind("<Escape>", lambda _e: win.destroy())
+        self.center_over_window(win)
+        win.after(150, lambda: (win.focus_force(), close.focus_set()))  # CTkToplevel otherwise opens behind
 
     def show_help(self):
         win = ctk.CTkToplevel(self)
@@ -1341,59 +1526,70 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
                                       text_color=WARN)
             return
         new = self.expand_paths(paths)
+        notes = []
         if not new:
-            # Append, so the welcome text (including any missing-tool line) stays visible.
             if self.add_problems:
-                self._write_box("No files could be added:\n" + problem_lines(self.add_problems))
+                self.set_notes("No files could be added:\n" + problem_lines(self.add_problems), warn=True)
             else:
-                self._write_box("No files found in what was added.")
+                self.set_notes("No files found in what was added.", warn=True)
             return
 
-        # Added files join the list instead of replacing it.
-        combined = self.deduplicate_paths(self.files + new)
-        note = None
-        if len(combined) == len(self.files):
-            note = "Those files are already in the list."
+        # Added files join the list (instead of replacing it).
+        before = self.pending_files()
+        combined = self.deduplicate_paths(before + new)
+        if len(combined) == len(before):
+            notes.append("Those files are already in the list.")
         if any(f.lower().endswith(".age") for f in combined):
             non_age_count = sum(1 for f in combined if not f.lower().endswith(".age"))
             combined = [f for f in combined if f.lower().endswith(".age")]
             if non_age_count:
-                note = f"Detected .age files - decrypt mode. Ignored {non_age_count} non-.age file(s)."
-
-        self.files = combined
-        self.last_summary = None
-        self.update_file_box()
-        if note:
-            self._write_box(note)
+                notes.append(f".age files present: decrypt mode. Ignored {non_age_count} other file(s).")
         if self.skipped_subfolders:
-            self._write_box(f"{self.skipped_subfolders} subfolder(s) not included: "
-                            "a folder adds only the files directly inside it.")
+            notes.append(f"{self.skipped_subfolders} subfolder(s) not included: "
+                         "a folder adds only the files directly inside it.")
         if self.add_problems:
-            self._write_box("Not added:\n" + problem_lines(self.add_problems))
+            notes.append("Not added:\n" + problem_lines(self.add_problems))
+        warn = bool(self.add_problems)
+
+        if combined == before:
+            self.set_notes("\n".join(notes), warn=warn)  # nothing new: keep the list and last results
+            return
+        # New files start a new batch: finished rows from the last run go away.
+        old = {e["path"]: e for e in self.entries if e["status"] != "done"}
+        self.entries = [old.get(p) or {"path": p, "size": self.size_of(p), "status": "ready"} for p in combined]
+        self.last_summary = None
+        self.reset_progress()
         self.update_mode_from_files()
+        self.render_list()
+        self.set_notes("\n".join(notes), warn=warn)
         self.update_mode_and_input_visibility()
         self.update_action_buttons()
+        if self.tab == "Passphrase":
+            self.password.focus_set()
+
+    @staticmethod
+    def size_of(path):
+        try:
+            return os.path.getsize(long_path(path))
+        except OSError:
+            return None
 
     def on_drop(self, event):
         try:
             files = self.tk.splitlist(event.data)
         except Exception:
             files = [event.data]
+        self.set_drop_highlight(False)
         self.apply_new_paths(files)
 
     def update_mode_from_files(self):
-        if not self.files:
+        files = self.pending_files()
+        if not files:
             self.mode = None
-        elif all(f.lower().endswith(".age") for f in self.files):
+        elif all(f.lower().endswith(".age") for f in files):
             self.mode = "decrypt"
         else:
             self.mode = "encrypt"
-
-    def update_file_box(self):
-        # File name first, folder after: long paths would otherwise hide the names.
-        lines = [f"{os.path.basename(f)}    ({os.path.dirname(f)})" for f in self.files]
-        self._write_box("\n".join(lines), clear_first=True)
-        self.reset_progress()
 
     def reset_progress(self):
         # An empty CTkProgressBar still draws a dot; hide the fill colour until a job runs.
@@ -1402,50 +1598,55 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def clear(self):
         """Clears the file list and passphrases. Saved recipients/identities are kept."""
-        self.files = []
+        if self.is_processing:
+            return
+        self.entries = []
         self.last_summary = None
         self.mode = None
-        self.show_welcome()
+        self.gen_armed = False
         self.reset_progress()
         self.password.delete(0, "end")
         self.confirm.delete(0, "end")
+        self.toggle_show_password(False)
+        self.set_notes(self.missing_tools_note(), warn=True, sticky=True)
+        self.render_list()
         self.update_mode_and_input_visibility()
         self.update_action_buttons()
 
     # ------------------------------------------------------------------ actions
 
     def encrypt(self):
-        if self.is_processing or not self.files:
+        if self.is_processing or not self.pending_files():
             return
         if self.active_mode_kind() == "passphrase":
             pw = self.password.get()
             if not pw:
-                self.log_to_box("Please enter a passphrase.", clear_first=True)
+                self.set_notes("Please enter a passphrase.", warn=True)
                 return
             if pw != self.confirm.get():
-                self.log_to_box("Passphrases do not match.", clear_first=True)
+                self.set_notes("Passphrases do not match.", warn=True)
                 return
             self.run_process("-e", pw)
         else:
             problem = self.recipient_encrypt_problem()
             if problem:
-                self.log_to_box(problem, clear_first=True)
+                self.set_notes(problem, warn=True)
                 return
             self.save_settings()
             self.run_process("-e", None)
 
     def decrypt(self):
-        if self.is_processing or not self.files:
+        if self.is_processing or not self.pending_files():
             return
         if self.active_mode_kind() == "passphrase":
             pw = self.password.get()
             if not pw:
-                self.log_to_box("Please enter a passphrase.", clear_first=True)
+                self.set_notes("Please enter a passphrase.", warn=True)
                 return
             self.run_process("-d", pw)
         else:
             if not self.get_recipient_inputs()[5]:
-                self.log_to_box("Please provide at least one existing identity file.", clear_first=True)
+                self.set_notes("Please provide at least one existing identity file.", warn=True)
                 return
             self.save_settings()
             self.run_process("-d", None)
@@ -1460,7 +1661,7 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
                 proc.terminate()
             except Exception:
                 pass
-        self.log_to_box("Cancelling...")
+        self.hint_label.configure(text="Cancelling...", text_color=MUTED)
 
     def run_tool(self, cmd, env=None, cancellable=False, out_handle=None):
         """Run a CLI tool, keep a handle so Cancel can kill it. Returns (returncode, output).
@@ -1511,17 +1712,17 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def run_process(self, flag, password):
         if not os.path.isfile(self.age_path):
-            self.log_to_box("age.exe not found.", clear_first=True)
+            self.set_notes("age.exe not found.", warn=True)
             return
 
         active_kind = self.active_mode_kind()
         if active_kind == "passphrase" and not os.path.isfile(self.batchpass_path):
-            self.log_to_box("age-plugin-batchpass.exe not found.", clear_first=True)
+            self.set_notes("age-plugin-batchpass.exe not found.", warn=True)
             return
 
         # Snapshot everything the worker needs; the worker never reads Tk widgets.
         _, valid_r, rfile, rfile_ok, _, valid_i = self.get_recipient_inputs()
-        files = list(self.files)
+        files = self.pending_files()
         armor = self.armor_var.get()
         is_encrypt = flag == "-e"
 
@@ -1532,40 +1733,28 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
 
         self.is_processing = True
         self.cancel_event.clear()
+        self.last_summary = None
+        if not self.notes_sticky:
+            self.set_notes("")
+        for e in self.entries:
+            if e["status"] == "failed":  # retried now
+                e.update(status="ready", error=None)
         self.progress.set(0)
         self.progress.configure(progress_color=ACCENT)
+        self.render_list()
+        self.update_mode_and_input_visibility()
         self.update_action_buttons()
 
         def worker():
             ok = failed = 0
-            last_folder = None
+            warnings = []
             summary = "Stopped."
-            self.ui_queue.put(("progress", 0, len(files)))
             try:
-                self.log_to_box("=== Processing ===", clear_first=True)
-                self.log_to_box("Output is written next to the source files; existing files are never overwritten.")
-                if active_kind == "passphrase":
-                    self.log_to_box("Using passphrase mode via age-plugin-batchpass.")
-                else:
-                    self.log_to_box("Using recipient mode.")
-                    if is_encrypt:
-                        if valid_r:
-                            self.log_to_box(f"Recipients from textbox: {len(valid_r)}")
-                        if rfile_ok:
-                            self.log_to_box(f"Recipients file: {rfile}")
-                    else:
-                        self.log_to_box(f"Identity files: {len(valid_i)}")
-
-                for idx, f in enumerate(files, 1):
+                for idx, f in enumerate(files):
                     if self.cancel_event.is_set():
                         break
-                    verb = "Encrypting" if is_encrypt else "Decrypting"
-                    folder = os.path.dirname(f)
-                    if folder != last_folder:
-                        self.log_to_box(f"In {folder}:")
-                        last_folder = folder
-                    self.log_to_box(f"  [{idx}/{len(files)}] {verb} {os.path.basename(f)}")
-
+                    self.ui_queue.put(("current", f))
+                    self.ui_queue.put(("progress", idx, len(files), os.path.basename(f)))
                     part_file = out_file = None
                     try:
                         final_target = f + ".age" if is_encrypt else decrypted_name(f)
@@ -1582,24 +1771,27 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
                     if rc == 0:
                         # A file that finished is kept even if Cancel was pressed meanwhile.
                         ok += 1
-                        self.log_to_box(f"      -> {os.path.basename(out_file)}")
+                        self.ui_queue.put(("result", f, True, out_file, None, False))
                         if output:
-                            self.log_to_box(output)
+                            warnings.append(f"{os.path.basename(f)}: {output}")
                     else:
-                        if not self.cancel_event.is_set():
+                        cancelled = self.cancel_event.is_set()
+                        if not cancelled:
                             failed += 1
                         self.remove_output(part_file)  # this job's own .part file
-                        self.log_to_box("      Cancelled" if self.cancel_event.is_set() else f"      FAILED: {output or 'unknown error'}")
+                        self.ui_queue.put(("result", f, False, None,
+                                           None if cancelled else (output or "unknown error"), cancelled))
                     self.inflight_output = None
-                    self.ui_queue.put(("progress", idx, len(files)))
+                    self.ui_queue.put(("progress", idx + 1, len(files), None))
 
                 skipped = len(files) - ok - failed
                 summary = f"Finished: {ok} OK, {failed} failed"
                 if skipped:
-                    summary += f", {skipped} skipped (cancelled)"
-                self.log_to_box(f"=== {summary} ===")
+                    summary += f", {skipped} not processed (cancelled)"
+                if warnings:
+                    self.ui_queue.put(("notes", "age said:\n" + "\n".join(warnings), True))
             finally:
-                self.ui_queue.put(("done", True, summary + "."))
+                self.ui_queue.put(("done", summary + "."))
 
         self.worker_thread = threading.Thread(target=worker, daemon=True)
         self.worker_thread.start()
@@ -1615,7 +1807,7 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
     def inspect(self):
         if self.is_processing:
             return
-        targets = [f for f in self.files if f.lower().endswith(".age")]
+        targets = [e["path"] for e in self.entries if e["path"].lower().endswith(".age")]
         if not targets or not os.path.isfile(self.inspect_path):
             return
         self.is_processing = True
@@ -1623,8 +1815,8 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         self.update_action_buttons()
 
         def worker():
+            parts = []
             try:
-                self.log_to_box("=== age-inspect ===", clear_first=True)
                 for f in targets:
                     if self.cancel_event.is_set():
                         break
@@ -1632,14 +1824,11 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
                         _, output = self.run_tool([self.inspect_path, f], cancellable=True)
                     except Exception as exc:
                         output = f"Unexpected error: {exc}"
-                    self.log_to_box(output, plain=True)
-                    self.log_to_box("")
-                # Inspect replaced the visible file list, but the files stay loaded.
-                self.log_to_box(f"{len(files_loaded)} file(s) still loaded for decryption.")
+                    parts.append(output)
+                self.ui_queue.put(("info", "Inspect", "\n\n".join(parts)))
             finally:
-                self.ui_queue.put(("done", False, None))
+                self.ui_queue.put(("done", None))
 
-        files_loaded = list(self.files)
         self.worker_thread = threading.Thread(target=worker, daemon=True)
         self.worker_thread.start()
 
@@ -1658,7 +1847,7 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         path = os.path.normpath(path)
         if os.path.exists(path):
             # age-keygen refuses to overwrite, and destroying an existing secret key would be worse anyway.
-            self.log_to_box(f"{path} already exists. A key file is never overwritten; pick a new name.", clear_first=True)
+            self.set_notes(f"{path} already exists. A key file is never overwritten; pick a new name.", warn=True)
             return
 
         cmd = [self.keygen_path]
@@ -1670,7 +1859,7 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         except Exception as exc:
             rc, output = -1, str(exc)
         if rc != 0:
-            self.log_to_box(f"age-keygen failed: {output}", clear_first=True)
+            self.show_info("Key generation failed", f"age-keygen failed: {output}")
             return
 
         public_key = None
@@ -1685,15 +1874,16 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
             self.append_line(self.recipient_box, public_key)
         self.append_line(self.identity_box, path)
         self.on_recipient_inputs_changed()
-        self.log_to_box(f"New identity saved to {path} and added to Identity files.", clear_first=True)
         if mixes:
-            self.log_to_box("Its public key was NOT added to Recipients: post-quantum and classic keys "
-                            "can't be mixed in one file. It is in the key file, on the '# public key:' line.")
+            about_public = ("Its public key was NOT added to 'Encrypt to': post-quantum and classic keys can't be "
+                            "mixed in one file. It is in the key file, on the '# public key:' line.")
         elif public_key:
-            self.log_to_box("Its public key was added to Recipients.")
+            about_public = "Its public key was added to 'Encrypt to'."
         else:
-            self.log_to_box("Could not read its public key; get it with: age-keygen -y " + path)
-        self.log_to_box("Keep the identity file secret and backed up.")
+            about_public = "Could not read its public key; get it with: age-keygen -y " + path
+        self.show_info("New key pair", f"Saved to {path} and added to 'Decrypt with'.\n\n{about_public}\n\n"
+                       "Keep the identity file secret and backed up: without it, files encrypted to its "
+                       "public key can't be decrypted.")
 
     def on_close(self):
         self.cancel()
