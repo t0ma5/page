@@ -104,6 +104,11 @@ class Secrets(unittest.TestCase):
         self.assertIn(CLASSIC, boxes)
         paths = page.keep_lines(r"C:\keys\me.txt" + "\nhunter2", page.looks_like_path)
         self.assertEqual(paths, r"C:\keys\me.txt")
+        # A passphrase with a colon or slash is not a path either.
+        for stray in ("correct:horse/battery", "a/b", "x:y"):
+            self.assertFalse(page.looks_like_path(stray), stray)
+        for path in (r"D:\k.txt", "D:/k.txt", r"\\nas\keys\k.txt", r'"C:\My keys\k.txt"'):
+            self.assertTrue(page.looks_like_path(path), path)
 
     def test_long_path_is_not_a_blob(self):
         path = r"C:\Users\abcdefghijklmnopqrstuvwxyz0123456789abcdefgh\key.txt"
@@ -163,10 +168,19 @@ class AddProblems(unittest.TestCase):
     """Dropped paths that can't be read are explained instead of "No files found"."""
 
     def expand(self, paths):
-        from types import SimpleNamespace
+        files, _skipped, problems, _sizes = page.expand_paths(paths)
+        return files, problems
 
-        fake = SimpleNamespace()
-        return page.AgeGui.expand_paths(fake, paths), fake.add_problems
+    def test_folder_sizes_and_subfolders(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "b.txt"), "wb") as f:
+                f.write(b"12345")
+            open(os.path.join(d, "a.txt"), "w").close()
+            os.mkdir(os.path.join(d, "sub"))
+            files, skipped, problems, sizes = page.expand_paths([d])
+            self.assertEqual([os.path.basename(p) for p in files], ["a.txt", "b.txt"])
+            self.assertEqual((skipped, problems), (1, []))
+            self.assertEqual(sizes[os.path.join(d, "b.txt")], 5)
 
     def test_missing_file_and_drive(self):
         with tempfile.TemporaryDirectory() as d:
@@ -206,10 +220,53 @@ class AddProblems(unittest.TestCase):
         self.assertEqual(page.without_long_prefix(long_unc), unc)
 
     def test_long_lists_are_cut(self):
-        problems = [f"p{i}: not found (moved or deleted?)." for i in range(8)]
+        problems = [f"p{i}: not found (moved or deleted?)." for i in range(page.PROBLEM_LIMIT + 3)]
         text = page.problem_lines(problems)
-        self.assertEqual(text.count("\n"), 5)
+        self.assertEqual(text.count("\n"), page.PROBLEM_LIMIT)
         self.assertTrue(text.endswith("  ...and 3 more."))
+
+
+class FitWidth(unittest.TestCase):
+    measure = staticmethod(len)  # one "pixel" per character
+
+    def test_fits_unchanged(self):
+        self.assertEqual(page.fit_width("short.txt", self.measure, 20), "short.txt")
+
+    def test_end_and_middle(self):
+        name = "quarterly-report-2025 (1).pdf"
+        self.assertEqual(page.fit_width(name, self.measure, 10), "quarterly…")
+        mid = page.fit_width(name, self.measure, 15, middle=True)
+        self.assertEqual(len(mid), 15)
+        self.assertTrue(mid.startswith("quarter") and mid.endswith("(1).pdf"), mid)
+
+
+class RemoveOutput(unittest.TestCase):
+    def test_removes_and_reports(self):
+        with tempfile.TemporaryDirectory() as d:
+            part = os.path.join(d, "x.age.part")
+            open(part, "w").close()
+            self.assertTrue(page.AgeGui.remove_output(part))
+            self.assertFalse(os.path.exists(part))
+            self.assertTrue(page.AgeGui.remove_output(None))
+
+    def test_open_file_is_reported_not_hidden(self):
+        if os.name != "nt":
+            self.skipTest("Windows file locking")
+        import ctypes
+        with tempfile.TemporaryDirectory() as d:
+            part = os.path.join(d, "x.age.part")
+            open(part, "w").close()
+            # Open without FILE_SHARE_DELETE, as a scanner might: deleting fails.
+            k32 = ctypes.windll.kernel32
+            k32.CreateFileW.restype = ctypes.c_void_p
+            h = k32.CreateFileW(part, 0x80000000, 1, None, 3, 0, None)
+            try:
+                orig = page._retry_while_locked
+                page._retry_while_locked = lambda a, tries=1, delay=0: orig(a, 1, 0)
+                self.assertFalse(page.AgeGui.remove_output(part))
+            finally:
+                page._retry_while_locked = orig
+                k32.CloseHandle(ctypes.c_void_p(h))
 
 
 class RecipientsFile(unittest.TestCase):
@@ -285,13 +342,9 @@ class RoundTrip(unittest.TestCase):
 
     @need_age
     def test_dry_run_catches_what_prefixes_miss(self):
-        class Fake:  # just enough of the window for recipients_dry_run_problem
-            age_path = AGE
-        problem = page.AgeGui.recipients_dry_run_problem(Fake(), ["age1notarealkey"], "")
-        self.assertIsNotNone(problem)
-        self.assertIsNone(page.AgeGui.recipients_dry_run_problem(Fake(), [CLASSIC], ""))
-        problem = page.AgeGui.recipients_dry_run_problem(Fake(), ["ecdsa-sha2-nistp256 AAAAE2VjZHNh"], "")
-        self.assertIsNotNone(problem)
+        self.assertIsNotNone(page.age_dry_run(AGE, ["age1notarealkey"], ""))
+        self.assertIsNone(page.age_dry_run(AGE, [CLASSIC], ""))
+        self.assertIsNotNone(page.age_dry_run(AGE, ["ecdsa-sha2-nistp256 AAAAE2VjZHNh"], ""))
 
 
 if __name__ == "__main__":

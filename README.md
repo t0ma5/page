@@ -23,17 +23,17 @@ page is unofficial and not affiliated with age's authors. age's own documentatio
 ## Use it
 
 1. Start `page.exe`.
-2. Add files: drop files or folders anywhere on the window, or use the blue **Files** / **Folder** buttons. Each addition joins the list (name, folder, size); duplicates are skipped, and **×** removes a file. A folder adds the files directly inside it; the line under the list says how many subfolders were left out, and which paths couldn't be read and why. **Clear** empties the list and the passphrase fields (saved recipients and identity files are kept).
+2. Add files: drop files or folders anywhere on the window, or use the blue **Files** / **Folder** buttons. Each addition joins the list (name, folder, size); duplicates are skipped, and **×** removes a file. A folder adds the files directly inside it; the line under the list says how many subfolders were left out, and which paths couldn't be read and why (**Show all** opens a long list in full). The list draws up to 100 rows; further files are counted under it and processed like the others. Hover a name for its full path. **Clear** empties the list and the passphrase fields (saved recipients and identity files are kept).
 3. Choose a tab, **Passphrase** or **Keys**, and fill it in (see below).
 4. Click the button at the bottom right (it reads e.g. **Encrypt 3 files** or **Decrypt 1 file**), or press Enter in a passphrase field.
 
-The line next to the button always says what is missing (for example "Repeat the passphrase to confirm it." or "Add an identity file under 'Decrypt with'."). After a run, each file's row shows its result: a check mark and the file written (with a button that shows it in its folder), or what went wrong. Finished files stay in the list for reference but aren't processed again; failed ones are retried by the next run.
+The line next to the button always says what is missing (for example "Repeat the passphrase to confirm it." or "Add an identity file under 'Decrypt with'."). After a run, each file's row shows its result: a check mark and the file written (with a button that shows it in its folder), or the start of what went wrong. Hover the result for all of it; every failure is also listed under the list. Finished files stay in the list for reference but aren't processed again; failed ones are retried by the next run.
 
-**Encrypt or decrypt is chosen by the files:** `.age` files are decrypted, everything else is encrypted; the line under the list says which ("3 files will be encrypted"). If a drop mixes both, only the `.age` files are kept and the rest are listed as ignored.
+**Encrypt or decrypt is chosen by the files:** `.age` files are decrypted, everything else is encrypted; the line under the list says which ("3 files will be encrypted"). If a drop mixes both, only the `.age` files are kept and the line under the list says how many others were ignored.
 
 ### Passphrase tab
 
-For files encrypted with a passphrase (`age -p`). Encrypting asks for the passphrase twice; the eye button reveals it. **Generate a strong passphrase** fills in a random one (30 characters, about 148 bits) and shows it, so you can copy it somewhere safe. A passphrase containing a line break (usually from pasting) is refused. The passphrase stays in the fields after a run so the next batch can reuse it.
+For files encrypted with a passphrase (`age -p`). Encrypting asks for the passphrase twice; the eye button reveals it. **Generate a strong passphrase** fills in a random one (six groups of five characters, 35 with the dashes, about 148 bits) and shows it, so you can copy it somewhere safe. A passphrase containing a line break (usually from pasting) is refused. The passphrase stays in the fields after a run so the next batch can reuse it.
 
 Inspect may report a passphrase file as "post-quantum". That is correct: passphrase encryption (`scrypt`) uses no public-key cryptography, so there is nothing for a quantum computer to break.
 
@@ -58,7 +58,7 @@ Not supported: passphrase-protected identity files and passphrase-protected SSH 
 Output goes next to each source file. Encrypt adds `.age`; decrypt removes it.
 
 - Existing files are **never overwritten**. If the name is taken, the output becomes `name (1).ext`, `name (2).ext`, ... (`archive (1).tar.gz`, `.gitignore (1)`).
-- While a file is being processed it is written as `name.part` and renamed only when it finished correctly. A failed or cancelled file leaves nothing behind. If the PC crashes mid-file, you find an obvious `.part` file, never a truncated file under the real name.
+- While a file is being processed it is written as `name.part` and renamed only when it finished correctly. A failed or cancelled file leaves nothing behind (if antivirus still holds the partial file after a few seconds of retrying, page names it so you can delete it). If the PC crashes mid-file, you find an obvious `.part` file, never a truncated file under the real name.
 - Works on virtual drives such as a mounted Cryptomator vault, and in folders with paths longer than 260 characters.
 - Finished files are not processed again, so pressing the button twice can't create duplicate copies.
 
@@ -87,7 +87,7 @@ The GUI opens with the selected files in the list (same rules as a drop). Severa
 | File | Role |
 | --- | --- |
 | `page.exe` | The GUI (Windows x64 or ARM64, matching the zip). Built from `page.py`; script edits need a rebuild. |
-| `page.py` | GUI source. |
+| `page.py` | GUI source (in the repository, not in the release zip). |
 | `icon.ico` | Icon for the GUI and the Send to shortcut: a white "P" on blue. |
 | `age.exe` | age v1.3.2. Does all encryption and decryption. Required. |
 | `age-plugin-batchpass.exe` | Lets the GUI pass the passphrase without a terminal. Needed for the Passphrase tab. |
@@ -97,7 +97,7 @@ The GUI opens with the selected files in the list (same rules as a drop). Severa
 | `unregister_context_menu.bat` / `.ps1` | Remove it. |
 | `pageSettings.json` | Created by the GUI. |
 
-The startup text in the file list says whether the age tools were found.
+If an age tool is missing, the line under the file list says which one and what it is needed for.
 
 ## How a file is processed
 
@@ -115,7 +115,7 @@ age.exe -d -i <identity> ... <file>             (identities)
 
 ## Tests
 
-`tests\test_page.py` checks the file handling without opening a window: output naming, `.part` files, the settings filter, recipients-file checks, and real round trips through `age.exe` (passphrase, wrong passphrase, and age's own check of the recipients). From this folder:
+`tests\test_page.py` (in the repository) checks the file handling without opening a window: output naming, `.part` files, the settings filter, recipients-file checks, and real round trips through `age.exe` (passphrase, wrong passphrase, and age's own check of the recipients). From this folder:
 
 ```text
 python -m unittest discover -s tests -v

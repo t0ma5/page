@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import datetime
+import collections
 import json
 import os
 import queue
@@ -12,7 +12,8 @@ import threading
 import time
 import tkinter.font as tkfont
 import webbrowser
-from tkinter import TclError, filedialog
+import tkinter as tk
+from tkinter import filedialog
 
 import customtkinter as ctk
 from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -95,7 +96,8 @@ PASS_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"  # no look-alikes (i, l, o, 0,
 
 
 def generate_passphrase():
-    """6 groups of 5 characters from a 31-character alphabet, about 148 bits (same as sage)."""
+    """6 groups of 5 characters from a 31-character alphabet (35 characters with the
+    dashes), about 148 bits (same as sage)."""
     return "-".join("".join(secrets.choice(PASS_ALPHABET) for _ in range(5)) for _ in range(6))
 
 
@@ -115,6 +117,26 @@ def format_size(n):
 def fit_text(text, max_chars):
     """Cut text to max_chars with an ellipsis (Tk labels don't shorten text themselves)."""
     return text if len(text) <= max_chars else text[: max(1, max_chars - 1)] + "\u2026"
+
+
+def fit_width(text, measure, max_px, middle=False):
+    """Shorten text with an ellipsis until measure(text) fits max_px. middle=True keeps
+    both ends ("quarterly-re\u20262025 (1).pdf"), so a name's " (1)" and extension stay visible."""
+    if measure(text) <= max_px:
+        return text
+    lo, hi, best = 1, len(text) - 1, text[:1] + "\u2026"
+    while lo <= hi:  # the longest cut that still fits
+        keep = (lo + hi) // 2
+        if middle:
+            head = (keep + 1) // 2
+            cand = text[:head] + "\u2026" + text[len(text) - (keep - head):]
+        else:
+            cand = text[:keep] + "\u2026"
+        if measure(cand) <= max_px:
+            best, lo = cand, keep + 1
+        else:
+            hi = keep - 1
+    return best
 
 
 def folder_of(path):
@@ -182,13 +204,178 @@ def describe_add_error(path, exc):
     return f"{path}: can't be read ({getattr(exc, 'strerror', None) or exc})."
 
 
-def problem_lines(problems):
-    """List unreadable paths, at most 5. (When page runs as administrator the window
-    shows a permanent warning line, so it isn't repeated here.)"""
-    lines = [f"  {text}" for text in problems[:5]]
-    if len(problems) > 5:
-        lines.append(f"  ...and {len(problems) - 5} more.")
+PROBLEM_LIMIT = 50  # the line under the list previews a few; "Show all" opens these
+
+
+def problem_lines(problems, limit=PROBLEM_LIMIT):
+    """List unreadable paths, at most `limit`. (When page runs as administrator the
+    Admin pill explains hidden drives, so it isn't repeated here.)"""
+    lines = [f"  {text}" for text in problems[:limit]]
+    if len(problems) > limit:
+        lines.append(f"  ...and {len(problems) - limit} more.")
     return "\n".join(lines)
+
+
+def expand_paths(paths):
+    """Dropped or chosen paths -> (files, skipped subfolders, problems, sizes).
+
+    A folder adds the files directly inside it. Paths that can't be read are listed
+    in problems with the reason. Runs off the UI thread: a sleeping network drive
+    can take a long time to answer. os.scandir gives each entry's type and size in
+    one call.
+    """
+    # tk.splitlist already removed Tcl's {braces}; stripping again would break
+    # real names such as "backup{1}" or a "{GUID}" folder.
+    # long_path: paths over 260 characters must not be silently skipped.
+    files, problems, sizes = [], [], {}
+    skipped = 0
+    for p in paths:
+        # Absolute, so Send-to/command-line paths don't depend on the working folder.
+        try:
+            p = os.path.normpath(os.path.abspath(p))
+            info = os.stat(long_path(p))
+        except ValueError:
+            problems.append(f"{p}: not a valid path.")
+            continue
+        except OSError as exc:
+            problems.append(describe_add_error(p, exc))
+            continue
+        if stat.S_ISREG(info.st_mode):
+            files.append(p)
+            sizes[p] = info.st_size
+        elif stat.S_ISDIR(info.st_mode):
+            try:
+                with os.scandir(long_path(p)) as it:
+                    items = sorted(it, key=lambda d: d.name)
+            except OSError as exc:
+                problems.append(describe_add_error(p, exc))
+                continue
+            for item in items:
+                full_path = os.path.join(p, item.name)
+                try:
+                    if item.is_file():
+                        files.append(full_path)
+                        sizes[full_path] = item.stat().st_size
+                    elif item.is_dir():
+                        skipped += 1
+                except OSError:
+                    continue  # vanished meanwhile
+    return files, skipped, problems, sizes
+
+
+def age_dry_run(age_path, recipients, recipients_file):
+    """Ask age.exe whether it accepts these recipients, by encrypting nothing to
+    nowhere. Returns the problem in words, or None (also when it can't be checked:
+    the real run then reports any error per file)."""
+    cmd = [age_path, "-e"]
+    for r in recipients:
+        cmd += ["-r", r]
+    if recipients_file:
+        cmd += ["-R", recipients_file]
+    try:
+        proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.PIPE, timeout=10, creationflags=NO_WINDOW)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    err = proc.stderr.decode("utf-8", "replace")
+    lines = [l.strip() for l in err.splitlines()
+             if l.strip() and "report unexpected or unhelpful errors" not in l]
+    if proc.returncode != 0:
+        msg = lines[0] if lines else "age.exe refused these recipients."
+        return "age: " + msg.split("error: ", 1)[-1]
+    if any("ignoring unsupported SSH key" in l for l in lines):
+        return ("The recipients file has an SSH key age can't use (too short or of an "
+                "unsupported type); age would skip it. Remove it or comment it out with #.")
+    return None
+
+
+def monitor_rect(x, y):
+    """(left, top, right, bottom) of the monitor's work area at screen point x, y, or None."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                        ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+        user32 = ctypes.windll.user32
+        user32.MonitorFromPoint.restype = wintypes.HANDLE
+        user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+        user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MONITORINFO)]
+        mon = user32.MonitorFromPoint(wintypes.POINT(x, y), 2)  # MONITOR_DEFAULTTONEAREST
+        info = MONITORINFO()
+        info.cbSize = ctypes.sizeof(info)
+        if mon and user32.GetMonitorInfoW(mon, ctypes.byref(info)):
+            r = info.rcWork
+            return r.left, r.top, r.right, r.bottom
+    except Exception:
+        pass
+    return None
+
+
+class Tooltip:
+    """The full text of a shortened label, shown after a short hover (like sage's titles)."""
+
+    active = None  # the tip on screen; hidden on scroll, focus loss or minimise (hide_all)
+
+    @classmethod
+    def hide_all(cls, _e=None):
+        if cls.active is not None:
+            cls.active.hide()
+
+    def __init__(self, widgets, text):
+        self.text, self.tip, self.job = text, None, None
+        self.owner = widgets[0]
+        for w in widgets:
+            w.bind("<Enter>", self.schedule, add="+")
+            w.bind("<Leave>", self.hide, add="+")
+            w.bind("<ButtonPress>", self.hide, add="+")
+
+    def schedule(self, _e=None):
+        self.hide()
+        self.job = self.owner.after(500, self.show)
+
+    def show(self):
+        self.job = None
+        if not self.text or not self.owner.winfo_exists():
+            return
+        Tooltip.hide_all()
+        px, py = self.owner.winfo_pointerx(), self.owner.winfo_pointery()
+        self.tip = tk.Toplevel(self.owner)
+        self.tip.wm_overrideredirect(True)
+        self.tip.withdraw()  # measured first, then placed so it stays on the pointer's monitor
+        tk.Label(self.tip, text=self.text, justify="left", bg="#2b2b2b", fg="#ebebeb", relief="solid",
+                 borderwidth=1, padx=8, pady=5, wraplength=520, font=("Segoe UI", 9)).pack()
+        self.tip.update_idletasks()
+        w, h = self.tip.winfo_reqwidth(), self.tip.winfo_reqheight()
+        x, y = px + 14, py + 18
+        area = monitor_rect(px, py)
+        if area:
+            left, top, right, bottom = area
+            x = max(left, min(x, right - w))
+            if y + h > bottom:
+                y = max(top, py - h - 8)  # above the pointer instead
+        self.tip.wm_geometry(f"+{x}+{y}")
+        self.tip.deiconify()
+        Tooltip.active = self
+
+    def hide(self, _e=None):
+        if self.job:
+            try:
+                self.owner.after_cancel(self.job)
+            except Exception:
+                pass
+            self.job = None
+        if self.tip is not None:
+            try:
+                self.tip.destroy()
+            except Exception:
+                pass
+            self.tip = None
+        if Tooltip.active is self:
+            Tooltip.active = None
 
 
 def running_elevated():
@@ -327,8 +514,11 @@ def without_secrets(value):
 
 
 def looks_like_path(line):
-    """A Windows or relative path: has a separator or a drive colon."""
-    return ("\\" in line or "/" in line or ":" in line) and not looks_like_base64_blob(line)
+    """A full Windows path ("C:\\..." or "\\\\server\\share\\..."): what Browse and key
+    generation put in the boxes. Other text, say "correct:horse/battery" pasted into
+    the wrong box, is not written to the settings file."""
+    line = line.strip('"')
+    return bool(re.match(r"^(?:[A-Za-z]:[\\/]|\\\\)", line)) and not looks_like_base64_blob(line)
 
 
 def keep_lines(value, keep_line):
@@ -378,6 +568,8 @@ def recipients_file_problem(path):
 
 MIX_MESSAGE = ("Post-quantum (age1pq1...) and classic keys can't be mixed in one file: the classic key "
                "would make it breakable by a quantum computer. Use one kind.")
+CHECKING_KEYS = "Checking the keys with age.exe..."
+MAX_ROWS = 100  # rows drawn in the file list; Tk gets slow with many more (the rest are counted)
 
 
 def decrypted_name(path):
@@ -414,7 +606,20 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         self.notes_warn = False
         self.notes_sticky = False  # a note a run doesn't clear (generated passphrase, settings)
         self.gen_armed = False
+        self.show_pass = False  # read from here, not the entry: a placeholder reports show=""
+        self.settings_notice = ""  # damaged / unsaveable settings: survives Clear
         self.ui_queue = queue.Queue()
+        self.ui_backlog = collections.deque()
+        self.add_queue = []  # drops waiting while an earlier one is still being read
+        self.adding = False
+        self.next_grid_row = 0
+        self.more_label = None
+        self.add_generation = 0  # Clear bumps it: a drop still being read then lands nowhere
+        self._dry_run_cache = {}
+        self._dry_run_busy = False  # one age.exe check at a time ...
+        self._dry_run_next = None  # ... and only the latest waiting input is checked next
+        self.name_labels = {}  # id(entry) -> (label, name): re-fitted when the list gets wider
+        self._refit_job = None
 
         self.base_dir = self.get_base_dir()
         self.age_path = os.path.join(self.base_dir, "age.exe")
@@ -427,7 +632,6 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         available_fonts = set(tkfont.families())
         self.ui_font = "Segoe UI" if "Segoe UI" in available_fonts else "TkDefaultFont"
         self.mono_font = "Consolas" if "Consolas" in available_fonts else "Courier New"
-        self.ui_font_size = 14
         font = (self.ui_font, 14)
         small_font = self.small_font = (self.ui_font, 13)
         bold_font = (self.ui_font, 14, "bold")
@@ -498,10 +702,11 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         self.password.pack()
         # The eye sits on top of the entry, so it takes the entry's own colours.
         entry_fg = ctk.ThemeManager.theme["CTkEntry"]["fg_color"]
-        self.eye_btn = ctk.CTkButton(pw_wrap, text="", image=self.icon("eye", ICON_GREY), width=30, height=26,
+        self.eye_btn = ctk.CTkButton(pw_wrap, **self.icon_kw("eye", ICON_GREY, "Show"), width=30, height=26,
                                      fg_color=entry_fg, bg_color=entry_fg, hover_color=("gray85", "#4a4d50"),
-                                     command=self.toggle_show_password)
+                                     command=self.toggle_show_password, font=(self.ui_font, 11))
         self.eye_btn.place(relx=1.0, x=-5, rely=0.5, anchor="e")
+        self.keep_text_clear_of_eye()
         self.confirm = ctk.CTkEntry(self.passphrase_box, placeholder_text="Repeat passphrase", show="*",
                                     width=340, height=36, font=font)
         self.confirm.pack(pady=(0, 6))
@@ -582,8 +787,8 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
                                          compound="left", width=88, height=32, command=self.inspect,
                                          font=small_font, **GHOST)
         self.inspect_btn.pack(side="left", padx=(2, 0))
-        self.about_btn = ctk.CTkButton(toolbar, text="", image=self.icon("info", text_hex), width=32, height=32,
-                                       command=self.show_about, **GHOST)
+        self.about_btn = ctk.CTkButton(toolbar, **self.icon_kw("info", text_hex, "i"), width=32, height=32,
+                                       command=self.show_about, font=bold_font, **GHOST)
         self.about_btn.pack(side="right")
 
         # Running as administrator: a warning dialog at start (like About), and an amber
@@ -605,17 +810,25 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         head.pack(fill="x")
         self.configure_row_grid(head)
         for col, text in ((1, "Name"), (2, "Folder"), (3, "Size")):
+            # The Folder/Result column is as wide as the rows' cells (150, scaled alike), so they line up.
             lbl = ctk.CTkLabel(head, text=text, font=(self.ui_font, 12), text_color=MUTED,
-                               anchor="e" if col == 3 else "w")
+                               anchor="e" if col == 3 else "w", **({"width": 150} if col == 2 else {}))
             lbl.grid(row=0, column=col, sticky="ew", padx=(0, 8) if col == 3 else 0, pady=2)
             if col == 2:
                 self.col_second = lbl
         ctk.CTkFrame(files_frame, height=1, corner_radius=0, fg_color=LINE).pack(fill="x")
         # The lines under the list are packed (from the bottom up) before the list itself:
         # Tk squeezes the last-packed widget first, and that must be the list, not them.
-        self.notes_label = ctk.CTkLabel(files_frame, text="", anchor="w", justify="left",
+        notes_box = ctk.CTkFrame(files_frame, fg_color="transparent")
+        notes_box.pack(side="bottom", fill="x", padx=8, pady=(0, 14))
+        self.notes_label = ctk.CTkLabel(notes_box, text="", anchor="w", justify="left",
                                         font=(self.ui_font, 12), text_color=MUTED)
-        self.notes_label.pack(side="bottom", fill="x", padx=8, pady=(0, 14))
+        self.notes_label.pack(fill="x")
+        # A long note (many unreadable paths, age's warnings, failures) is previewed in a
+        # few lines; this opens all of it.
+        self.notes_more = ctk.CTkButton(notes_box, text="Show all", width=10, height=20, fg_color="transparent",
+                                        hover_color=("gray85", "#2d2d2d"), text_color=ACCENT,
+                                        font=(self.ui_font, 12), command=self.show_all_notes)
         self.summary_label = ctk.CTkLabel(files_frame, text="", anchor="w", justify="left",
                                           font=(self.ui_font, 12), text_color=MUTED)
         self.summary_label.pack(side="bottom", fill="x", padx=8, pady=(6, 0))
@@ -631,11 +844,15 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         self.dnd_bind("<<Drop>>", self.on_drop)
         self.dnd_bind("<<DropEnter>>", lambda e: self.set_drop_highlight(True, e))
         self.dnd_bind("<<DropLeave>>", lambda e: self.set_drop_highlight(False, e))
+        # A tooltip goes away on scroll, focus loss (Alt-Tab) and minimise, not only on mouse-out.
+        self.bind_all("<MouseWheel>", Tooltip.hide_all, add="+")
+        for seq in ("<FocusOut>", "<Unmap>"):
+            self.bind(seq, Tooltip.hide_all, add="+")
+        # Names are cut to the list's width; re-cut them when it changes (window resized).
+        self.list_frame._parent_canvas.bind("<Configure>", self.schedule_refit_names, add="+")
 
         self.load_settings()
-        missing = self.missing_tools_note()
-        if missing:
-            self.set_notes(missing, warn=True, sticky=True)
+        self.show_standing_notes()
         self.set_tab(self.tab, save=False)
         self.render_list()
         self.set_initial_geometry()
@@ -684,6 +901,42 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         if key not in cache:
             cache[key] = glyph_image(name, color, size)
         return cache[key]
+
+    def icon_kw(self, name, color, fallback, size=16):
+        """image= for a button, or a text label when the icon font is missing (no blank buttons)."""
+        image = self.icon(name, color, size)
+        return {"image": image, "text": ""} if image is not None else {"image": None, "text": fallback}
+
+    def widget_scaling(self):
+        try:
+            return ctk.ScalingTracker.get_widget_scaling(self)
+        except Exception:
+            return 1.0
+
+    def keep_text_clear_of_eye(self):
+        """A long passphrase must not run under the eye button: pad the entry's text on the right.
+        CTkEntry re-grids its inner entry on a DPI change, so this is re-applied on <Configure>."""
+        try:
+            inner = self.password._entry
+            pad = inner.grid_info().get("padx", 6)
+            pad = [int(p) for p in (pad if isinstance(pad, (tuple, list)) else str(pad).split())]
+            current = (pad[0], pad[-1])  # Tk reports one number when both sides are equal
+            want = (pad[0], round(38 * self.widget_scaling()))
+            if current != want:  # no change, no new <Configure>: no loop
+                inner.grid_configure(padx=want)
+            if not getattr(self, "_eye_pad_bound", False):
+                self._eye_pad_bound = True
+                self.password.bind("<Configure>", lambda _e: self.keep_text_clear_of_eye(), add="+")
+        except Exception:
+            pass  # a different customtkinter: the text may run under the eye, nothing worse
+
+    def show_standing_notes(self):
+        """The notes that stay until fixed: missing age tools, a settings problem."""
+        text = "\n".join(t for t in (self.missing_tools_note(), self.settings_notice) if t)
+        self.set_notes(text, warn=bool(text), sticky=bool(text))
+
+    def show_all_notes(self):
+        self.show_info("Details", self.notes)
 
     @staticmethod
     def configure_row_grid(frame):
@@ -774,11 +1027,13 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         return "recipient" if self.tab == "Recipient" else "passphrase"
 
     def toggle_show_password(self, show=None):
-        if show is None:
-            show = self.password.cget("show") != ""
+        # The state is kept here: while the placeholder is showing, CTkEntry reports
+        # show="" whatever was set, so reading it back made the first click do nothing.
+        self.show_pass = (not self.show_pass) if show is None else bool(show)
         for entry in (self.password, self.confirm):
-            entry.configure(show="" if show else "*")
-        self.eye_btn.configure(image=self.icon("eye", ACCENT[1] if show else ICON_GREY))
+            entry.configure(show="" if self.show_pass else "*")
+        kw = self.icon_kw("eye", ACCENT[1] if self.show_pass else ICON_GREY, "Hide" if self.show_pass else "Show")
+        self.eye_btn.configure(**kw)
 
     def pending_files(self):
         """The files the next run will process (finished rows are not run again)."""
@@ -803,8 +1058,13 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         recipients_file = self.recipients_file.get().strip().strip('"')
         identities = self.parse_multiline_lines(self.identity_box)
         valid_recipients = [r for r in recipients if self.classify_recipient(r)]
+        # Full paths: a relative one would depend on the working folder, and a file
+        # literally named "-" must not reach age as "-" (which means standard input).
+        if recipients_file:
+            recipients_file = os.path.abspath(recipients_file)
         recipients_file_ok = bool(recipients_file) and os.path.isfile(long_path(recipients_file))
-        valid_identities = [i for i in identities if os.path.isfile(long_path(i))]
+        valid_identities = [os.path.abspath(i) for i in identities
+                            if not contains_secret(i) and os.path.isfile(long_path(os.path.abspath(i)))]
         return recipients, valid_recipients, recipients_file, recipients_file_ok, identities, valid_identities
 
     def recipient_encrypt_problem(self):
@@ -853,32 +1113,31 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
             except OSError:
                 pass
         key = (tuple(recipients), recipients_file, stamp)
-        cache = getattr(self, "_dry_run_cache", None)
-        if cache and cache[0] == key:
-            return cache[1]
-        cmd = [self.age_path, "-e"]
-        for r in recipients:
-            cmd += ["-r", r]
-        if recipients_file:
-            cmd += ["-R", recipients_file]
-        try:
-            proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                  stderr=subprocess.PIPE, timeout=10, creationflags=NO_WINDOW)
-            err = proc.stderr.decode("utf-8", "replace")
-            lines = [l.strip() for l in err.splitlines()
-                     if l.strip() and "report unexpected or unhelpful errors" not in l]
-            if proc.returncode != 0:
-                msg = lines[0] if lines else "age.exe refused these recipients."
-                problem = "age: " + msg.split("error: ", 1)[-1]
-            elif any("ignoring unsupported SSH key" in l for l in lines):
-                problem = ("The recipients file has an SSH key age can't use (too short or of an "
-                           "unsupported type); age would skip it. Remove it or comment it out with #.")
-            else:
+        if key in self._dry_run_cache:
+            return self._dry_run_cache[key]
+        # age.exe runs in the background (a recipients file on a sleeping network drive
+        # must not freeze the window); its answer arrives as a "dry_run" UI message.
+        # One check at a time: while typing, only the latest text waits for its turn.
+        job = (key, list(recipients), recipients_file)
+        if self._dry_run_busy:
+            self._dry_run_next = job
+        else:
+            self.start_dry_run(job)
+        return CHECKING_KEYS
+
+    def start_dry_run(self, job):
+        key, recipients, recipients_file = job
+        self._dry_run_busy = True
+        age_path = self.age_path
+
+        def work():
+            try:
+                problem = age_dry_run(age_path, recipients, recipients_file)
+            except Exception:  # an odd paste (NUL, lone surrogate): the run reports it per file
                 problem = None
-        except (OSError, subprocess.TimeoutExpired):
-            problem = None  # can't check now; the real run reports any error per file
-        self._dry_run_cache = (key, problem)
-        return problem
+            self.ui_queue.put(("dry_run", key, problem))  # always, or the hint would stay "Checking..."
+
+        threading.Thread(target=work, daemon=True).start()
 
     def recipient_mode_hint(self):
         """(ready, hint, is_warning) for recipient mode; shown in the bottom bar next to the button."""
@@ -886,7 +1145,7 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         if self.mode == "encrypt":
             problem = self.recipient_encrypt_problem()
             if problem:
-                return False, problem, bool(recipients or rfile)
+                return False, problem, problem != CHECKING_KEYS and bool(recipients or rfile)
             parts = []
             if valid_r:
                 kinds = ", ".join(sorted({self.classify_recipient(r) for r in valid_r}))
@@ -926,10 +1185,15 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         return "\n".join(missing)
 
     def render_list(self):
-        """Rebuild every row (rows are few; results update single rows, see update_row)."""
+        """Rebuild the list: on add and Clear only. A run's progress and results update
+        single rows (update_row). At most MAX_ROWS rows are drawn, each is about ten Tk
+        widgets; the rest are counted in a line at the end."""
         for child in self.list_frame.winfo_children():
             child.destroy()
         self.row_widgets = {}
+        self.name_labels = {}
+        self.next_grid_row = 0
+        self.more_label = None
         self.update_column_header()
         if not self.entries:
             empty = ctk.CTkFrame(self.list_frame, fg_color="transparent")
@@ -941,57 +1205,130 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
                          "Output goes next to each file; existing files are never overwritten."):
                 ctk.CTkLabel(empty, text=line, font=(self.ui_font, 13), text_color=MUTED).pack()
             return
-        for i, entry in enumerate(self.entries):
-            self.build_row(entry, i)
+        for entry in self.entries[:MAX_ROWS]:
+            self.build_row(entry)
+        self.update_more_label()
 
-    def build_row(self, entry, index):
+    def update_more_label(self):
+        hidden = len(self.entries) - len(self.row_widgets)
+        if hidden <= 0:
+            if self.more_label is not None:
+                self.more_label.destroy()
+                self.more_label = None
+            return
+        text = (f"...and {hidden} more file{'' if hidden == 1 else 's'}, not shown. "
+                "They are processed like the others; the line below counts them.")
+        if self.more_label is None:
+            self.more_label = ctk.CTkLabel(self.list_frame, text=text, font=(self.ui_font, 12),
+                                           text_color=MUTED, anchor="w")
+        self.more_label.configure(text=text)
+        # After the last row (Tk grids have at most about 10000 rows, so no fixed huge index);
+        # build_row takes this slot for a new row, and this is called again after it.
+        self.more_label.grid(row=self.next_grid_row, column=0, sticky="ew", padx=8, pady=(6, 4))
+
+    def cell(self, text, max_px, middle=True):
+        """Text shortened to fit max_px (unscaled) in the list's font."""
+        scaling = self.widget_scaling()
+        if getattr(self, "_cell_scaling", None) != scaling:  # moved to a monitor with another DPI
+            self._cell_scaling = scaling
+            self.cell_font = tkfont.Font(family=self.ui_font, size=-round(13 * scaling))
+        return fit_width(text, self.cell_font.measure, max_px * scaling, middle)
+
+    def build_row(self, entry, grid_row=None):
+        """Draw one row. grid_row: where it goes (an updated row keeps its place)."""
+        if grid_row is None:
+            grid_row = self.next_grid_row
+            self.next_grid_row += 2
         status = entry["status"]
         row = ctk.CTkFrame(self.list_frame, fg_color="transparent", corner_radius=4, height=34)
-        row.grid(row=index * 2, column=0, sticky="ew")
+        row.grid(row=grid_row, column=0, sticky="ew")
         self.configure_row_grid(row)
         name = os.path.basename(entry["path"])
-        icon_name, icon_color = {
-            "done": ("check", OK_COLOR[1]), "failed": ("error", ERR_COLOR[1]), "working": ("working", ACCENT[1]),
-        }.get(status, ("lock" if entry["path"].lower().endswith(".age") else "file", ICON_GREY))
-        ctk.CTkLabel(row, text="", image=self.icon(icon_name, icon_color), width=24).grid(row=0, column=0, padx=(6, 0))
-        ctk.CTkLabel(row, text=fit_text(name, 30), font=(self.ui_font, 13), anchor="w").grid(
-            row=0, column=1, sticky="ew", padx=(4, 6))
+        icon_name, icon_color, mark = {
+            "done": ("check", OK_COLOR[1], "\u2713"), "failed": ("error", ERR_COLOR[1], "!"),
+            "working": ("working", ACCENT[1], "\u2026"),
+        }.get(status, ("lock" if entry["path"].lower().endswith(".age") else "file", ICON_GREY, ""))
+        image = self.icon(icon_name, icon_color)
+        ctk.CTkLabel(row, text="" if image else mark, image=image, width=24, text_color=icon_color).grid(
+            row=0, column=0, padx=(6, 0))
+        name_lbl = ctk.CTkLabel(row, text=self.cell(name, self.name_width()), font=(self.ui_font, 13), anchor="w")
+        self.name_labels[id(entry)] = (name_lbl, name)
+        name_lbl.grid(row=0, column=1, sticky="ew", padx=(4, 6))
         if status == "done":
-            detail, color = "\u2192 " + os.path.basename(entry.get("output") or ""), MUTED
+            output = entry.get("output") or ""
+            detail, color, tip = "\u2192 " + self.cell(os.path.basename(output), 128), MUTED, "Written: " + output
         elif status == "failed":
-            detail, color = entry.get("error") or "Failed", ERR_COLOR
+            error = entry.get("error") or "Failed"
+            # The start of the reason in the row; all of it on hover and under the list.
+            detail, color, tip = self.cell(error.splitlines()[0], 140, middle=False), ERR_COLOR, error
         else:
-            detail, color = folder_of(entry["path"]), MUTED
-        ctk.CTkLabel(row, text=fit_text(detail, 22), font=(self.ui_font, 13), text_color=color, anchor="w").grid(
-            row=0, column=2, sticky="ew")
+            detail, color, tip = self.cell(folder_of(entry["path"]), 140), MUTED, entry["path"]
+        # Text cut to 140 inside a 150 label: a gap before the size column.
+        detail_lbl = ctk.CTkLabel(row, text=detail, font=(self.ui_font, 13), text_color=color, anchor="w",
+                                  width=150)
+        detail_lbl.grid(row=0, column=2, sticky="ew")
         ctk.CTkLabel(row, text=format_size(entry.get("size")), font=(self.ui_font, 13), text_color=MUTED,
                      anchor="e").grid(row=0, column=3, sticky="ew", padx=(0, 8))
         actions = ctk.CTkFrame(row, fg_color="transparent")
         actions.grid(row=0, column=4, sticky="e", padx=(0, 4))
         if status == "done":
-            ctk.CTkButton(actions, text="", image=self.icon("folder-open", ICON_GREY), width=28, height=28,
+            ctk.CTkButton(actions, **self.icon_kw("folder-open", ICON_GREY, "\u2197"), width=28, height=28,
                           command=lambda e=entry: self.show_in_folder(e), **GHOST).pack(side="left")
-        ctk.CTkButton(actions, text="", image=self.icon("x", ICON_GREY, 12), width=28, height=28,
-                      state="disabled" if self.is_processing else "normal",
-                      command=lambda e=entry: self.remove_entry(e), **GHOST).pack(side="left", padx=(2, 0))
+        remove_btn = ctk.CTkButton(actions, **self.icon_kw("x", ICON_GREY, "\u00d7", 12), width=28, height=28,
+                                   state="disabled" if self.is_processing else "normal",
+                                   command=lambda e=entry: self.remove_entry(e), **GHOST)
+        remove_btn.pack(side="left", padx=(2, 0))
         line = ctk.CTkFrame(self.list_frame, height=1, corner_radius=0, fg_color=LINE)
-        line.grid(row=index * 2 + 1, column=0, sticky="ew")
+        line.grid(row=grid_row + 1, column=0, sticky="ew")
         # Row hover, like a list in Explorer.
         widgets = [row] + list(row.winfo_children())
         for w in widgets:
             w.bind("<Enter>", lambda _e, r=row: r.configure(fg_color=ROW_HOVER), add="+")
             w.bind("<Leave>", lambda _e, r=row: r.configure(fg_color="transparent"), add="+")
-        self.row_widgets[id(entry)] = (row, line)
+        Tooltip([name_lbl], entry["path"])
+        if tip:
+            Tooltip([detail_lbl], tip)
+        self.row_widgets[id(entry)] = (row, line, remove_btn)
+
+    def name_width(self):
+        """The name gets what the other columns leave (icon 30, result 150, size 64, buttons 66,
+        paddings); measured on screen: the name column is the list's width minus about 280."""
+        list_w = self.list_frame._parent_canvas.winfo_width() / self.widget_scaling()
+        return max(140, int(list_w) - 290) if list_w > 100 else 220
+
+    def schedule_refit_names(self, _e=None):
+        if self._refit_job:
+            self.after_cancel(self._refit_job)
+        self._refit_job = self.after(200, self.refit_names)
+
+    def refit_names(self):
+        """Only the name labels' text changes: much cheaper than redrawing the rows."""
+        self._refit_job = None
+        width = self.name_width()
+        if getattr(self, "_names_fitted_to", None) == width:
+            return
+        self._names_fitted_to = width
+        for label, name in list(self.name_labels.values()):
+            try:
+                label.configure(text=self.cell(name, width))
+            except Exception:
+                pass  # a row destroyed meanwhile
 
     def update_row(self, entry):
-        """Redraw one row in place (a file's result or progress)."""
-        old = self.row_widgets.get(id(entry))
-        if not old or entry not in self.entries:
-            return self.render_list()
-        for w in old:
-            w.destroy()
-        self.build_row(entry, self.entries.index(entry))
+        """Redraw one row in place (a file's result or progress). Rows past MAX_ROWS aren't drawn."""
+        old = self.row_widgets.pop(id(entry), None)
+        self.name_labels.pop(id(entry), None)
+        if old is not None:
+            grid_row = old[0].grid_info().get("row", self.next_grid_row)
+            for w in old[:2]:
+                w.destroy()
+            self.build_row(entry, int(grid_row))
         self.update_column_header()
+
+    def set_rows_enabled(self, enabled):
+        """The \u00d7 buttons are off while a job runs (instead of redrawing every row)."""
+        for _row, _line, remove_btn in self.row_widgets.values():
+            remove_btn.configure(state="normal" if enabled else "disabled")
 
     def update_column_header(self):
         # After a run the second column shows each file's result instead of its folder.
@@ -1003,10 +1340,22 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         if self.is_processing:
             return
         self.entries = [e for e in self.entries if e is not entry]
-        if not any(e["status"] in ("done", "failed") for e in self.entries):
-            self.last_summary = None
+        # The last run's "Finished: 3 OK, 1 failed" no longer matches the list.
+        self.last_summary = None
+        if not self.entries:
+            self.render_list()  # the empty-list hint
+        else:
+            old = self.row_widgets.pop(id(entry), None)
+            self.name_labels.pop(id(entry), None)
+            if old is not None:
+                for w in old[:2]:
+                    w.destroy()
+                # A row that was past MAX_ROWS moves up into view.
+                if len(self.entries) >= MAX_ROWS:
+                    self.build_row(self.entries[MAX_ROWS - 1])
+            self.update_more_label()
+            self.update_column_header()
         self.update_mode_from_files()
-        self.render_list()
         self.update_mode_and_input_visibility()
         self.update_action_buttons()
 
@@ -1019,10 +1368,13 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         windir = os.environ.get("SystemRoot", r"C:\Windows")
         # Explorer parses its own command line: the path must be quoted even without
         # spaces, or a comma in it splits it; and it doesn't take \\?\ paths.
-        subprocess.Popen(f'"{os.path.join(windir, "explorer.exe")}" /select,"{without_long_prefix(path)}"')
+        try:
+            subprocess.Popen(f'"{os.path.join(windir, "explorer.exe")}" /select,"{without_long_prefix(path)}"')
+        except OSError as exc:
+            self.set_notes(f"Explorer couldn't be started: {exc.strerror or exc}", warn=True)
 
     def set_notes(self, text, warn=False, sticky=False):
-        self.notes, self.notes_warn, self.notes_sticky = text, warn, sticky
+        self.notes, self.notes_warn, self.notes_sticky = text, warn, sticky and bool(text)
         self.render_summary()
 
     def render_summary(self):
@@ -1037,47 +1389,91 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
             line = ""
         self.summary_label.configure(text=line)
         self.summary_label.pack_configure(pady=(6, 0) if line else (0, 0))
-        # At most 4 lines, so a long "Not added" list can't squeeze the file list.
+        # A preview of at most 3 lines (each kept to one line), so a long note can't
+        # squeeze the file list; "Show all" opens the whole text.
         lines = self.notes.splitlines()
-        text = "\n".join(lines[:4] + ([f"...and {len(lines) - 4} more lines."] if len(lines) > 4 else []))
+        long_note = len(lines) > 3 or any(len(l) > 110 for l in lines)
+        text = "\n".join(fit_text(l, 110) for l in lines[:3])
         self.notes_label.configure(text=text, text_color=WARN if self.notes_warn else MUTED)
+        if long_note:
+            more = len(lines) - 3
+            self.notes_more.configure(text=f"Show all ({more} more line{'' if more == 1 else 's'})"
+                                      if more > 0 else "Show all")
+            self.notes_more.pack(anchor="w")
+        else:
+            self.notes_more.pack_forget()
 
     def process_ui_queue(self):
+        """Apply the workers' messages, for at most about 40 ms per call, so the window
+        (and Cancel) stays responsive when files finish faster than rows can be drawn."""
         try:
             while True:
-                item = self.ui_queue.get_nowait()
-                try:
-                    kind = item[0]
-                    if kind == "current":
-                        entry = self.find_entry(item[1])
-                        if entry is not None and entry["status"] == "ready":
-                            for e in self.entries:
-                                if e["status"] == "working":
-                                    e["status"] = "ready"
-                                    self.update_row(e)
-                            entry["status"] = "working"
-                            self.update_row(entry)
-                    elif kind == "result":
-                        self.apply_result(*item[1:])
-                    elif kind == "progress":
-                        done, total, name = item[1], item[2], item[3]
-                        self.progress.set(done / total if total else 0)
-                        if name:
-                            self.hint_label.configure(text=f"Working on file {min(done + 1, total)} of {total}: {name}",
-                                                      text_color=MUTED)
-                    elif kind == "info":
-                        self.show_info(item[1], item[2])
-                    elif kind == "notes":
-                        self.set_notes(item[1], warn=item[2])
-                    elif kind == "done":
-                        self.finish_job(summary=item[1])
-                except Exception as exc:
-                    print(f"UI update failed: {exc!r}", file=sys.stderr)
+                self.ui_backlog.append(self.ui_queue.get_nowait())
         except queue.Empty:
             pass
+        deadline = time.monotonic() + 0.04
+        try:
+            while self.ui_backlog and time.monotonic() < deadline:
+                item = self.ui_backlog.popleft()
+                try:
+                    self.handle_ui_message(item)
+                except Exception as exc:
+                    print(f"UI update failed: {exc!r}", file=sys.stderr)
         finally:
             # Always reschedule: if this loop died, the UI would stay locked forever.
-            self.after(50, self.process_ui_queue)
+            self.after(10 if self.ui_backlog else 50, self.process_ui_queue)
+
+    def handle_ui_message(self, item):
+        kind = item[0]
+        if kind == "current":
+            # Skipped when the file's result is already waiting: no point drawing "working".
+            if any(i[0] == "result" and i[1] == item[1] for i in self.ui_backlog):
+                return
+            entry = self.find_entry(item[1])
+            if entry is not None and entry["status"] == "ready":
+                for e in self.entries:
+                    if e["status"] == "working":
+                        e["status"] = "ready"
+                        self.update_row(e)
+                entry["status"] = "working"
+                self.update_row(entry)
+        elif kind == "result":
+            self.apply_result(*item[1:])
+        elif kind == "progress":
+            if any(i[0] == "progress" for i in self.ui_backlog):
+                return  # a newer one is waiting
+            done, total, name = item[1], item[2], item[3]
+            self.progress.set(done / total if total else 0)
+            if name and not self.cancel_event.is_set():  # keep "Cancelling..." on screen
+                self.hint_label.configure(text=f"Working on file {min(done + 1, total)} of {total}: {name}",
+                                          text_color=MUTED)
+        elif kind == "info":
+            self.show_info(item[1], item[2])
+        elif kind == "notes":
+            self.set_notes(item[1], warn=item[2])
+        elif kind == "done":
+            self.finish_job(summary=item[1])
+        elif kind == "added":
+            self.adding = False
+            try:
+                if item[1] == self.add_generation:  # not from before a Clear
+                    self.apply_added(*item[2:])
+            finally:
+                if self.add_queue:
+                    self.start_next_add()
+                elif not self.is_processing:
+                    self.update_action_buttons()
+        elif kind == "dry_run":
+            key, problem = item[1], item[2]
+            self._dry_run_busy = False
+            if len(self._dry_run_cache) > 50:
+                self._dry_run_cache.clear()
+            self._dry_run_cache[key] = problem
+            job, self._dry_run_next = self._dry_run_next, None
+            if job and job[0] not in self._dry_run_cache:
+                self.start_dry_run(job)
+            if not self.is_processing:
+                self.update_action_buttons()
 
     def find_entry(self, path):
         return next((e for e in self.entries if e["path"] == path), None)
@@ -1101,10 +1497,11 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         for e in self.entries:
             if e["status"] == "working":
                 e["status"] = "ready"
+                self.update_row(e)
         if summary:
             self.last_summary = summary
         self.update_mode_from_files()
-        self.render_list()
+        self.set_rows_enabled(True)  # only the × buttons changed; no full redraw
         self.update_mode_and_input_visibility()
         self.update_action_buttons()
 
@@ -1137,7 +1534,7 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
                 self.settings_broken = True  # can't move it aside: don't save over it
                 notice = ("The settings file is damaged and could not be moved aside, "
                           "so settings will not be saved until it is fixed or deleted.")
-            self.after(0, lambda: self.set_notes(notice, warn=True, sticky=True))
+            self.settings_notice = notice  # shown by show_standing_notes, and again after Clear
             return
 
         def text(key):
@@ -1186,7 +1583,8 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
             # #9: say once that settings can't be saved, instead of failing silently.
             if not getattr(self, "settings_error_shown", False):
                 self.settings_error_shown = True
-                self.set_notes(f"Settings can't be saved next to page: {exc}", warn=True, sticky=True)
+                self.settings_notice = f"Settings can't be saved next to page: {exc}"
+                self.show_standing_notes()
 
     # ------------------------------------------------------------------ UI state
 
@@ -1226,6 +1624,8 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         if not os.path.isfile(self.age_path):
             return False, "Encrypt", "age.exe was not found next to this program.", True
         files = self.pending_files()
+        if self.adding:
+            return False, "Decrypt" if self.mode == "decrypt" else "Encrypt", "Reading the added files...", False
         if not files:
             if self.entries:
                 return False, "Encrypt", "All done. Add more files, or Clear to start over.", False
@@ -1241,7 +1641,8 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
             pw = self.password.get()
             if not pw:
                 return False, text, "Enter the passphrase.", False
-            if any(ch in pw + self.confirm.get() for ch in "\r\n"):
+            # The confirm field only counts when it is shown (encrypting).
+            if any(ch in pw + (self.confirm.get() if self.mode == "encrypt" else "") for ch in "\r\n"):
                 # A pasted line break would become part of the passphrase, so typing it
                 # later would not open the file.
                 return False, text, "The passphrase contains a line break (pasted?). Remove it.", True
@@ -1266,7 +1667,8 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
             w.configure(state=idle_state)
         has_age_files = any(e["path"].lower().endswith(".age") for e in self.entries)
         self.inspect_btn.configure(
-            state="normal" if (not busy and has_age_files and os.path.isfile(self.inspect_path)) else "disabled"
+            state="normal" if (not busy and not self.adding and has_age_files and os.path.isfile(self.inspect_path))
+            else "disabled"
         )
         self.keygen_btn.configure(state="normal" if (not busy and os.path.isfile(self.keygen_path)) else "disabled")
         self.armor_chk.configure(state="normal" if not busy and self.mode != "decrypt" else "disabled")
@@ -1344,6 +1746,9 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         box.pack(fill="both", expand=True, padx=12, pady=12)
         box.insert("0.0", RECIPIENT_HELP)
         box.configure(state="disabled")
+        win.bind("<Escape>", lambda _e: win.destroy())
+        scaling = self.widget_scaling()
+        self.center_over_window(win, size=(round(560 * scaling), round(380 * scaling)))
         win.after(150, win.focus_force)  # CTkToplevel otherwise opens behind the main window
 
     def show_about(self):
@@ -1407,7 +1812,17 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         for part in re.split(r"\b(page)\b", ADMIN_WARNING.removeprefix("Warning: ")):
             if part:
                 text.insert("end", part, ("center", "bold") if part == APP_NAME else ("center",))
-        text.configure(state="disabled", cursor="arrow")  # 3 lines at this width fit height=84
+        text.configure(state="disabled", cursor="arrow")
+        # As tall as the wrapped text (3 lines with Segoe UI at this width; more if the
+        # font or scaling differs), so no line is cut off.
+        try:
+            win.update_idletasks()
+            n = inner.count("1.0", "end-1c", "displaylines")
+            n = n[0] if isinstance(n, tuple) else n
+            if n:
+                text.configure(height=round((n * regular.metrics("linespace") + 12) / self.widget_scaling()))
+        except Exception:
+            pass
         close = ctk.CTkButton(body, text="Close", width=100, height=32, command=win.destroy,
                               font=self.small_font)
         close.pack(pady=(18, 0))
@@ -1415,12 +1830,17 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         self.center_over_window(win)
         win.after(150, lambda: (win.focus_force(), close.focus_set()))  # CTkToplevel otherwise opens behind
 
-    def center_over_window(self, win):
-        """Place a dialog in the middle of the main window instead of the screen's corner."""
-        win.update_idletasks()  # the dialog isn't on screen yet: use its requested size
-        x = self.winfo_rootx() + (self.winfo_width() - win.winfo_reqwidth()) // 2
-        y = self.winfo_rooty() + (self.winfo_height() - win.winfo_reqheight()) // 3
-        win.geometry(f"+{max(0, x)}+{max(0, y)}")  # position only, in physical pixels
+    def center_over_window(self, win, size=None):
+        """Place a dialog in the middle of the main window instead of the screen's corner.
+        size: its (width, height) in physical pixels when it has a fixed size; otherwise
+        its requested size is used (it isn't on screen yet)."""
+        win.update_idletasks()
+        w, h = size or (win.winfo_reqwidth(), win.winfo_reqheight())
+        x = self.winfo_rootx() + (self.winfo_width() - w) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - h) // 3
+        # Position only, in physical pixels. Not clamped at 0: a monitor left of or
+        # above the main one has negative coordinates.
+        win.geometry(f"+{x}+{y}")
 
     def link_label(self, parent, url):
         """A label that opens url in the default browser."""
@@ -1475,41 +1895,6 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
             textbox.insert("end-1c", "\n")
         textbox.insert("end-1c", line + "\n")
 
-    def expand_paths(self, paths):
-        # tk.splitlist already removed Tcl's {braces}; stripping again would break
-        # real names such as "backup{1}" or a "{GUID}" folder.
-        # long_path: paths over 260 characters must not be silently skipped.
-        # Paths that can't be read are kept in self.add_problems with the reason.
-        expanded = []
-        self.skipped_subfolders = 0
-        self.add_problems = []
-        for p in paths:
-            # Absolute, so Send-to/command-line paths don't depend on the working folder.
-            try:
-                p = os.path.normpath(os.path.abspath(p))
-                info = os.stat(long_path(p))
-            except ValueError:
-                self.add_problems.append(f"{p}: not a valid path.")
-                continue
-            except OSError as exc:
-                self.add_problems.append(describe_add_error(p, exc))
-                continue
-            if stat.S_ISREG(info.st_mode):
-                expanded.append(p)
-            elif stat.S_ISDIR(info.st_mode):
-                try:
-                    names = sorted(os.listdir(long_path(p)))
-                except OSError as exc:
-                    self.add_problems.append(describe_add_error(p, exc))
-                    continue
-                for name in names:
-                    full_path = os.path.join(p, name)
-                    if os.path.isfile(long_path(full_path)):
-                        expanded.append(full_path)
-                    elif os.path.isdir(long_path(full_path)):
-                        self.skipped_subfolders += 1
-        return expanded
-
     def deduplicate_paths(self, paths):
         seen = set()
         result = []
@@ -1521,15 +1906,41 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         return result
 
     def apply_new_paths(self, paths):
+        """Read dropped/chosen paths in the background (a network drive can be slow to
+        answer), one drop after another; apply_added puts the result in the list."""
         if self.is_processing:
             self.hint_label.configure(text="Busy: wait for the current job to finish, or press Cancel.",
                                       text_color=WARN)
             return
-        new = self.expand_paths(paths)
+        self.add_queue.append(list(paths))
+        if not self.adding:
+            self.start_next_add()
+
+    def start_next_add(self):
+        paths = self.add_queue.pop(0)
+        self.adding = True
+        self.update_action_buttons()
+        generation = self.add_generation
+
+        def work():
+            try:
+                result = expand_paths(paths)
+            except Exception as exc:  # never leave the window stuck in "Reading..."
+                result = ([], 0, [f"Unexpected error: {exc}"], {})
+            self.ui_queue.put(("added", generation) + tuple(result))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def apply_added(self, new, skipped_subfolders, problems, sizes):
+        if self.is_processing:
+            # Encrypt, Decrypt and Inspect wait while files are read, so this shouldn't
+            # happen; if it does, say so instead of dropping the files silently.
+            self.set_notes("Files added while a job ran were not included. Add them again.", warn=True)
+            return
         notes = []
         if not new:
-            if self.add_problems:
-                self.set_notes("No files could be added:\n" + problem_lines(self.add_problems), warn=True)
+            if problems:
+                self.set_notes("No files could be added:\n" + problem_lines(problems), warn=True)
             else:
                 self.set_notes("No files found in what was added.", warn=True)
             return
@@ -1544,19 +1955,19 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
             combined = [f for f in combined if f.lower().endswith(".age")]
             if non_age_count:
                 notes.append(f".age files present: decrypt mode. Ignored {non_age_count} other file(s).")
-        if self.skipped_subfolders:
-            notes.append(f"{self.skipped_subfolders} subfolder(s) not included: "
+        if skipped_subfolders:
+            notes.append(f"{skipped_subfolders} subfolder(s) not included: "
                          "a folder adds only the files directly inside it.")
-        if self.add_problems:
-            notes.append("Not added:\n" + problem_lines(self.add_problems))
-        warn = bool(self.add_problems)
+        if problems:
+            notes.append("Not added:\n" + problem_lines(problems))
+        warn = bool(problems)
 
         if combined == before:
             self.set_notes("\n".join(notes), warn=warn)  # nothing new: keep the list and last results
             return
         # New files start a new batch: finished rows from the last run go away.
         old = {e["path"]: e for e in self.entries if e["status"] != "done"}
-        self.entries = [old.get(p) or {"path": p, "size": self.size_of(p), "status": "ready"} for p in combined]
+        self.entries = [old.get(p) or {"path": p, "size": sizes.get(p), "status": "ready"} for p in combined]
         self.last_summary = None
         self.reset_progress()
         self.update_mode_from_files()
@@ -1567,12 +1978,6 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         if self.tab == "Passphrase":
             self.password.focus_set()
 
-    @staticmethod
-    def size_of(path):
-        try:
-            return os.path.getsize(long_path(path))
-        except OSError:
-            return None
 
     def on_drop(self, event):
         try:
@@ -1600,6 +2005,9 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         """Clears the file list and passphrases. Saved recipients/identities are kept."""
         if self.is_processing:
             return
+        # A drop still being read, and drops waiting behind it, are dropped too.
+        self.add_generation += 1
+        self.add_queue.clear()
         self.entries = []
         self.last_summary = None
         self.mode = None
@@ -1608,7 +2016,7 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         self.password.delete(0, "end")
         self.confirm.delete(0, "end")
         self.toggle_show_password(False)
-        self.set_notes(self.missing_tools_note(), warn=True, sticky=True)
+        self.show_standing_notes()
         self.render_list()
         self.update_mode_and_input_visibility()
         self.update_action_buttons()
@@ -1739,15 +2147,16 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         for e in self.entries:
             if e["status"] == "failed":  # retried now
                 e.update(status="ready", error=None)
+                self.update_row(e)
         self.progress.set(0)
         self.progress.configure(progress_color=ACCENT)
-        self.render_list()
+        self.set_rows_enabled(False)
         self.update_mode_and_input_visibility()
         self.update_action_buttons()
 
         def worker():
             ok = failed = 0
-            warnings = []
+            warnings, failures, leftovers = [], [], []
             summary = "Stopped."
             try:
                 for idx, f in enumerate(files):
@@ -1776,11 +2185,13 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
                             warnings.append(f"{os.path.basename(f)}: {output}")
                     else:
                         cancelled = self.cancel_event.is_set()
+                        error = output or "unknown error"
                         if not cancelled:
                             failed += 1
-                        self.remove_output(part_file)  # this job's own .part file
-                        self.ui_queue.put(("result", f, False, None,
-                                           None if cancelled else (output or "unknown error"), cancelled))
+                            failures.append(f"  {os.path.basename(f)}: {' '.join(error.split())}")
+                        if not self.remove_output(part_file):  # this job's own .part file
+                            leftovers.append(f"  {part_file}")
+                        self.ui_queue.put(("result", f, False, None, None if cancelled else error, cancelled))
                     self.inflight_output = None
                     self.ui_queue.put(("progress", idx + 1, len(files), None))
 
@@ -1788,8 +2199,17 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
                 summary = f"Finished: {ok} OK, {failed} failed"
                 if skipped:
                     summary += f", {skipped} not processed (cancelled)"
+                # The full reasons, under the list (the rows only have room for their start).
+                notes = []
+                if failures:
+                    notes.append("Failed:\n" + "\n".join(failures))
+                if leftovers:
+                    notes.append("Partial output that couldn't be deleted (in use?); delete it yourself:\n"
+                                 + "\n".join(leftovers))
                 if warnings:
-                    self.ui_queue.put(("notes", "age said:\n" + "\n".join(warnings), True))
+                    notes.append("age said:\n" + "\n".join(warnings))
+                if notes:
+                    self.ui_queue.put(("notes", "\n".join(notes), True))
             finally:
                 self.ui_queue.put(("done", summary + "."))
 
@@ -1798,20 +2218,26 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
 
     @staticmethod
     def remove_output(path):
+        """Delete a partial output file; True when it is gone. Retries for a moment
+        while antivirus or the indexer still has the new file open (as sage does)."""
+        if not path:
+            return True
         try:
-            if path and os.path.isfile(long_path(path)):
-                os.remove(long_path(path))
+            if os.path.isfile(long_path(path)):
+                _retry_while_locked(lambda: os.remove(long_path(path)), tries=30)
         except OSError:
             pass
+        return not os.path.exists(long_path(path))
 
     def inspect(self):
-        if self.is_processing:
+        if self.is_processing or self.adding:
             return
         targets = [e["path"] for e in self.entries if e["path"].lower().endswith(".age")]
         if not targets or not os.path.isfile(self.inspect_path):
             return
         self.is_processing = True
         self.cancel_event.clear()
+        self.set_rows_enabled(False)
         self.update_action_buttons()
 
         def worker():
@@ -1825,7 +2251,8 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
                     except Exception as exc:
                         output = f"Unexpected error: {exc}"
                     parts.append(output)
-                self.ui_queue.put(("info", "Inspect", "\n\n".join(parts)))
+                if parts:  # cancelled before the first file: no empty dialog
+                    self.ui_queue.put(("info", "Inspect", "\n\n".join(parts)))
             finally:
                 self.ui_queue.put(("done", None))
 
