@@ -2,7 +2,7 @@
   <img src="docs/cover.png" alt="page: Python GUI for age" width="100%">
 </p>
 
-# page v0.1.0
+# page v0.1.1
 
 > [!TIP]
 > **Use [sage](https://github.com/t0ma5/sage) instead.** sage is the same app, made by the same author, as a single exe with the official age library built in: no separate age tools to keep next to it, and it is where new features go. page stays available and gets fixes, but no new features.

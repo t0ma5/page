@@ -47,7 +47,7 @@ DANGER, DANGER_HOVER = "#8b2c2c", "#a33a3a"
 ENCRYPT_BADGE = ("#1f6aa5", "#7ab2e6")
 DECRYPT_BADGE = ("#b36b00", "#f0b050")
 APP_NAME = "page"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.1.1"
 REPO_URL = "https://github.com/t0ma5/page"
 AGE_URL = "https://github.com/FiloSottile/age"
 
