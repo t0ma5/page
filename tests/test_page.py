@@ -120,21 +120,35 @@ class AdminWarning(unittest.TestCase):
         with mock.patch.object(page, "running_elevated", return_value=elevated):
             return "\n".join(page.AgeGui.startup_status_lines(fake))
 
-    def test_warns_only_when_elevated(self):
-        self.assertIn(page.ADMIN_WARNING, self.lines(True))
-        self.assertTrue(page.ADMIN_WARNING.startswith("Warning: page is running as administrator."))
+    def test_exact_wording(self):
+        # The owner's wording, word for word.
+        self.assertEqual(page.ADMIN_WARNING,
+                         "Warning: page is running as administrator. Windows hides drives mapped by your normal "
+                         "account from it, also blocks drag & drop from Explorer. Close page and start it normally.")
+
+    def test_not_in_the_box(self):
+        # It's a permanent line above the box, not part of the box text.
+        self.assertNotIn("administrator", self.lines(True))
         self.assertNotIn("administrator", self.lines(False))
+
+    def test_elevation_check_runs(self):
+        self.assertIsInstance(page.running_elevated(), bool)
 
 
 class Bullets(unittest.TestCase):
-    def test_lines_sub_items_and_blanks(self):
-        got = page.bullet_lines("Drop files here.\n\n  .age files are decrypted.\nDone.")
+    def test_lines_keep_their_indentation(self):
+        got = page.bullet_lines("Drop files here.\n\n  .age files are decrypted.\n      -> out.age\nDone.")
         self.assertEqual(got, [
-            (page.BULLET, "Drop files here.", "ln"),
-            ("", "", None),
-            (page.SUB_BULLET, ".age files are decrypted.", "sub"),
-            (page.BULLET, "Done.", "ln"),
+            ("", "Drop files here."),
+            (None, ""),
+            ("  ", ".age files are decrypted."),
+            ("      ", "-> out.age"),
+            ("", "Done."),
         ])
+
+    def test_copy_drops_bullets_keeps_indentation(self):
+        shown = "• Encrypting\n  • [1/2] a.txt\n      • -> a.txt.age\n\n• Done • ok"
+        self.assertEqual(page.strip_bullets(shown), "Encrypting\n  [1/2] a.txt\n      -> a.txt.age\n\nDone • ok")
 
 
 class AddProblems(unittest.TestCase):
@@ -162,12 +176,22 @@ class AddProblems(unittest.TestCase):
         files, problems = self.expand([missing])
         self.assertEqual(files, [])
         self.assertEqual(problems[0], (missing + ": drive " + free + ": isn't available to page.", True))
-        self.assertIn(page.ADMIN_WARNING, page.problem_lines(problems, elevated=True))
-        self.assertNotIn("administrator", page.problem_lines(problems, elevated=False))
+        self.assertNotIn("administrator", page.problem_lines(problems))
+
+    def test_reasons(self):
+        p = os.path.join(tempfile.gettempdir(), "x.txt")
+        self.assertEqual(page.describe_add_error(p, PermissionError(13, "denied")), (p + ": access denied.", False))
+        self.assertEqual(page.describe_add_error(p, OSError(5, "boom")), (p + ": can't be read (boom).", False))
+        if os.name != "nt":
+            return
+        # An unreachable share is the server's problem, not a hidden drive (and no second network stat).
+        unc = r"\\nas\share\a.txt"
+        err = OSError(2, "The network path was not found", None, 53)
+        self.assertEqual(page.describe_add_error(unc, err), (unc + r": network share \\nas\share isn't reachable.", False))
 
     def test_long_lists_are_cut(self):
         problems = [(f"p{i}: not found (moved or deleted?).", False) for i in range(8)]
-        text = page.problem_lines(problems, elevated=False)
+        text = page.problem_lines(problems)
         self.assertEqual(text.count("\n"), 5)
         self.assertTrue(text.endswith("  ...and 3 more."))
 
@@ -239,7 +263,8 @@ class RoundTrip(unittest.TestCase):
             self.assertIsNone(self.run_age(["-d", "-j", "batchpass"], enc, page.decrypted_name(enc), self.env("wrong")))
             dec = self.run_age(["-d", "-j", "batchpass"], enc, page.decrypted_name(enc), self.env("pässwörd x"))
             self.assertEqual(os.path.basename(dec), "a (1).txt")  # the original still exists
-            self.assertEqual(open(dec).read(), "hello page\n")
+            with open(dec, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "hello page\n")
             self.assertFalse([n for n in os.listdir(d) if n.endswith(".part")])
 
     @need_age

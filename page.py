@@ -3,6 +3,7 @@ import datetime
 import json
 import os
 import queue
+import re
 import stat
 import subprocess
 import sys
@@ -10,7 +11,7 @@ import threading
 import time
 import tkinter.font as tkfont
 import webbrowser
-from tkinter import filedialog
+from tkinter import TclError, filedialog
 
 import customtkinter as ctk
 from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -85,29 +86,41 @@ ADMIN_WARNING = ("Warning: page is running as administrator. Windows hides drive
                  "from it, also blocks drag & drop from Explorer. Close page and start it normally.")
 
 
-BULLET = "• "
-SUB_BULLET = "  • "
+BULLET = "\u2022 "
 
 
 def bullet_lines(text):
-    """Split box text into (prefix, body, tag) lines: each line gets a bullet, a line
-    starting with spaces is a sub-item, and a blank line stays blank."""
+    """Split box text into (indent, body) lines. A line keeps its own leading spaces
+    (so nesting shows) and gets a bullet before its text; a blank line is (None, "")."""
     out = []
     for raw in text.split("\n"):
-        body = raw.strip()
+        body = raw.lstrip(" \t").rstrip()
         if not body:
-            out.append(("", "", None))
-        elif raw[:1].isspace():
-            out.append((SUB_BULLET, body, "sub"))
+            out.append((None, ""))
         else:
-            out.append((BULLET, body, "ln"))
+            out.append((raw[: len(raw) - len(raw.lstrip(" \t"))].replace("\t", "    "), body))
     return out
 
 
+def strip_bullets(text):
+    """Box text as it should be copied: indentation kept, bullets removed."""
+    return re.sub(r"(?m)^([ \t]*)\u2022 ", r"\1", text)
+
+
+# Bad network path, network name deleted, bad network name, no network.
+NET_UNREACHABLE = {53, 64, 67, 1222}
+
+
 def describe_add_error(path, exc):
-    """Why a dropped or chosen path can't be added, as (text, drive_missing)."""
+    """Why a dropped or chosen path can't be added, as (text, drive_missing).
+    drive_missing is only for drive letters: a mapped drive page can't see."""
     drive = os.path.splitdrive(path)[0]
-    if drive and not os.path.exists(drive + os.sep):
+    if drive.startswith("\\\\"):
+        # A network share: the server or share is the problem, not a hidden drive.
+        # Decided from the error alone, so there's no second network timeout.
+        if getattr(exc, "winerror", None) in NET_UNREACHABLE:
+            return f"{path}: network share {drive} isn't reachable.", False
+    elif drive and not os.path.exists(drive + os.sep):
         return f"{path}: drive {drive} isn't available to page.", True
     if isinstance(exc, FileNotFoundError):
         return f"{path}: not found (moved or deleted?).", False
@@ -116,27 +129,44 @@ def describe_add_error(path, exc):
     return f"{path}: can't be read ({getattr(exc, 'strerror', None) or exc}).", False
 
 
-def problem_lines(problems, elevated):
-    """List unreadable paths (at most 5); if a drive is missing because page runs as
-    administrator, say so once."""
+def problem_lines(problems):
+    """List unreadable paths, at most 5. (When page runs as administrator the window
+    shows a permanent warning line, so it isn't repeated here.)"""
     lines = [f"  {text}" for text, _ in problems[:5]]
     if len(problems) > 5:
         lines.append(f"  ...and {len(problems) - 5} more.")
-    if elevated and any(missing for _, missing in problems):
-        lines.append(ADMIN_WARNING)
     return "\n".join(lines)
 
 
 def running_elevated():
-    """True when page runs as administrator. Windows then blocks drag and drop from
-    Explorer (a normal-level program) and hides drives mapped by the user's normal
-    session, such as network drives and Cryptomator vaults."""
+    """True when page runs as administrator *with a normal session alongside* (a UAC
+    split token, TokenElevationTypeFull). Only then does Windows hide drives mapped by
+    the normal session (network drives, Cryptomator vaults) and block drag and drop
+    from Explorer. With UAC off, or the built-in Administrator account, there is no
+    normal session to switch to, so there is nothing to warn about."""
     if os.name != "nt":
         return False
     try:
         import ctypes
+        from ctypes import wintypes
 
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+        advapi32.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                                 wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        token = wintypes.HANDLE()
+        if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(token)):  # TOKEN_QUERY
+            return False
+        try:
+            value, size = wintypes.DWORD(), wintypes.DWORD()
+            ok = advapi32.GetTokenInformation(token, 18, ctypes.byref(value), ctypes.sizeof(value),
+                                              ctypes.byref(size))  # 18 = TokenElevationType
+            return bool(ok) and value.value == 2  # TokenElevationTypeFull
+        finally:
+            kernel32.CloseHandle(token)
     except (AttributeError, OSError):
         return False
 
@@ -415,6 +445,13 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
                                         font=small_font)
         self.browse_btn.pack(side="right", padx=(0, 6))
 
+        # Running as administrator: a permanent line above the box, so file lists and
+        # job logs can't push it out of view.
+        if running_elevated():
+            self.admin_banner = ctk.CTkLabel(files_frame, text=ADMIN_WARNING, text_color=WARN, font=small_font,
+                                             wraplength=540, justify="left", anchor="w")
+            self.admin_banner.pack(fill="x", pady=(6, 0))
+
         self.drop_border = ctk.ThemeManager.theme["CTkTextbox"]["border_color"]
         # A small requested height: the box still expands into all free space, but Tk
         # shrinks the last-packed widget (the tab card) first when space runs short, so a
@@ -426,6 +463,10 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         self.file_box.dnd_bind("<<Drop>>", self.on_drop)
         self.file_box.dnd_bind("<<DropEnter>>", lambda e: self.set_drop_highlight(True, e))
         self.file_box.dnd_bind("<<DropLeave>>", lambda e: self.set_drop_highlight(False, e))
+        # Copy without the bullets; re-measure the hanging indent if the font is rescaled
+        # (e.g. the window moved to a monitor with another scaling).
+        self.file_box._textbox.bind("<<Copy>>", self._copy_box)
+        self.file_box._textbox.bind("<Configure>", lambda e: self._refresh_bullet_tags(), add="+")
 
         # ---------------- Mode tabs ----------------
         # Tall enough for the Recipient tab, so switching tabs doesn't resize the file list.
@@ -792,8 +833,6 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         notice = getattr(self, "settings_notice", None)
         if notice:
             lines += ["", "  " + notice]
-        if running_elevated():
-            lines += ["", ADMIN_WARNING]
         return lines
 
     def show_welcome(self):
@@ -813,32 +852,61 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
                 self.log_error_shown = True
                 self.ui_queue.put(("log", f"(log.txt can't be written next to page: {exc})", False))
 
-    def _write_box(self, text, clear_first=False):
+    def _write_box(self, text, clear_first=False, plain=False):
+        """Each line gets a bullet after its own indentation, with wrapped text indented
+        under the first word. plain=True writes the text as it is (tool output such as
+        age-inspect's, which has its own layout)."""
         # The box is read-only for the user; unlock it only while writing.
         self.file_box.configure(state="normal")
         if clear_first:
             self.file_box.delete("0.0", "end")
-        self._configure_bullet_tags()
-        for prefix, body, tag in bullet_lines(text):
-            self.file_box.insert("end", prefix + body + "\n", tag)
+        if plain:
+            self.file_box.insert("end", text + "\n")
+        else:
+            for indent, body in bullet_lines(text):
+                if indent is None:
+                    self.file_box.insert("end", "\n")
+                else:
+                    self.file_box.insert("end", indent + BULLET + body + "\n", self._bullet_tag(len(indent)))
         self.file_box.see("end")
         self.file_box.configure(state="disabled")
 
-    def _configure_bullet_tags(self):
-        """Wrapped text lines up under the first word, after the bullet."""
-        if getattr(self, "_bullet_tags_ready", False):
-            return
-        font = tkfont.Font(font=self.file_box._textbox.cget("font"))
-        for tag, prefix in (("ln", BULLET), ("sub", SUB_BULLET)):
-            self.file_box.tag_config(tag, lmargin1=0, lmargin2=font.measure(prefix))
-        self._bullet_tags_ready = True
+    def _bullet_tag(self, indent):
+        """The tag for a line with this many leading spaces: wrapped text lines up after the bullet."""
+        self._bullet_tags = getattr(self, "_bullet_tags", set())
+        tag = f"bullet{indent}"
+        if tag not in self._bullet_tags:
+            self._bullet_tags.add(tag)
+            self._refresh_bullet_tags(force=True)
+        return tag
 
-    def log_to_box(self, text, clear_first=False):
+    def _refresh_bullet_tags(self, force=False):
+        """(Re)measure the hanging indents, when a tag is new or the font has changed."""
+        font_spec = str(self.file_box._textbox.cget("font"))
+        if not force and font_spec == getattr(self, "_bullet_font", None):
+            return
+        self._bullet_font = font_spec
+        font = tkfont.Font(font=font_spec)
+        for tag in getattr(self, "_bullet_tags", set()):
+            indent = int(tag[len("bullet"):])
+            self.file_box.tag_config(tag, lmargin1=0, lmargin2=font.measure(" " * indent + BULLET))
+
+    def _copy_box(self, _event=None):
+        """Copy the selection with its indentation but without the bullets."""
+        try:
+            text = self.file_box._textbox.get("sel.first", "sel.last")
+        except TclError:
+            return "break"  # nothing selected
+        self.clipboard_clear()
+        self.clipboard_append(strip_bullets(text))
+        return "break"
+
+    def log_to_box(self, text, clear_first=False, plain=False):
         """Thread-safe: Tk widgets are only touched from the main thread."""
         if threading.current_thread() is threading.main_thread():
-            self._write_box(text, clear_first)
+            self._write_box(text, clear_first, plain)
         else:
-            self.ui_queue.put(("log", text, clear_first))
+            self.ui_queue.put(("log", text, clear_first, plain))
         self.append_to_log_file(text)
 
     def process_ui_queue(self):
@@ -847,7 +915,7 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
                 item = self.ui_queue.get_nowait()
                 try:
                     if item[0] == "log":
-                        self._write_box(item[1], item[2])
+                        self._write_box(item[1], item[2], item[3] if len(item) > 3 else False)
                     elif item[0] == "progress":
                         done, total = item[1], item[2]
                         self.progress.set(done / total if total else 0)
@@ -1215,7 +1283,7 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         if not new:
             # Append, so the welcome text (including any missing-tool line) stays visible.
             if self.add_problems:
-                self._write_box("No files could be added:\n" + problem_lines(self.add_problems, running_elevated()))
+                self._write_box("No files could be added:\n" + problem_lines(self.add_problems))
             else:
                 self._write_box("No files found in what was added.")
             return
@@ -1240,7 +1308,7 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
             self._write_box(f"{self.skipped_subfolders} subfolder(s) not included: "
                             "a folder adds only the files directly inside it.")
         if self.add_problems:
-            self._write_box("Not added:\n" + problem_lines(self.add_problems, running_elevated()))
+            self._write_box("Not added:\n" + problem_lines(self.add_problems))
         self.update_mode_from_files()
         self.update_mode_and_input_visibility()
         self.update_action_buttons()
@@ -1503,7 +1571,7 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
                         _, output = self.run_tool([self.inspect_path, f], cancellable=True)
                     except Exception as exc:
                         output = f"Unexpected error: {exc}"
-                    self.log_to_box(output)
+                    self.log_to_box(output, plain=True)
                     self.log_to_box("")
                 # Inspect replaced the visible file list, but the files stay loaded.
                 self.log_to_box(f"{len(files_loaded)} file(s) still loaded for decryption.")
