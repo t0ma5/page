@@ -110,6 +110,57 @@ class Secrets(unittest.TestCase):
         self.assertEqual(page.without_secrets(path), path)
 
 
+class AdminWarning(unittest.TestCase):
+    def lines(self, elevated):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        fake = SimpleNamespace(age_path=sys.executable, batchpass_path=sys.executable,
+                               keygen_path=sys.executable, inspect_path=sys.executable)
+        with mock.patch.object(page, "running_elevated", return_value=elevated):
+            return "\n".join(page.AgeGui.startup_status_lines(fake))
+
+    def test_warns_only_when_elevated(self):
+        self.assertIn(page.ADMIN_WARNING, self.lines(True))
+        self.assertTrue(page.ADMIN_WARNING.startswith("Warning: page is running as administrator."))
+        self.assertNotIn("administrator", self.lines(False))
+
+
+class AddProblems(unittest.TestCase):
+    """Dropped paths that can't be read are explained instead of "No files found"."""
+
+    def expand(self, paths):
+        from types import SimpleNamespace
+
+        fake = SimpleNamespace()
+        return page.AgeGui.expand_paths(fake, paths), fake.add_problems
+
+    def test_missing_file_and_drive(self):
+        with tempfile.TemporaryDirectory() as d:
+            ok = os.path.join(d, "ok.txt")
+            open(ok, "w").close()
+            files, problems = self.expand([ok, os.path.join(d, "gone.txt")])
+            self.assertEqual(files, [ok])
+            self.assertEqual(len(problems), 1)
+            self.assertIn("gone.txt: not found (moved or deleted?).", problems[0][0])
+            self.assertFalse(problems[0][1])
+        free = next((c for c in "ZYXWVUTSRQPONMLKJIHG" if not os.path.exists(c + ":\\")), None)
+        if os.name != "nt" or free is None:
+            self.skipTest("needs Windows and a free drive letter")
+        missing = free + r":\vault\file.txt"
+        files, problems = self.expand([missing])
+        self.assertEqual(files, [])
+        self.assertEqual(problems[0], (missing + ": drive " + free + ": isn't available to page.", True))
+        self.assertIn(page.ADMIN_WARNING, page.problem_lines(problems, elevated=True))
+        self.assertNotIn("administrator", page.problem_lines(problems, elevated=False))
+
+    def test_long_lists_are_cut(self):
+        problems = [(f"p{i}: not found (moved or deleted?).", False) for i in range(8)]
+        text = page.problem_lines(problems, elevated=False)
+        self.assertEqual(text.count("\n"), 5)
+        self.assertTrue(text.endswith("  ...and 3 more."))
+
+
 class RecipientsFile(unittest.TestCase):
     def check(self, content):
         with tempfile.TemporaryDirectory() as d:

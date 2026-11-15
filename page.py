@@ -3,6 +3,7 @@ import datetime
 import json
 import os
 import queue
+import stat
 import subprocess
 import sys
 import threading
@@ -78,6 +79,47 @@ def extension_of(path):
         if lower.endswith(double) and len(name) > len(double):
             return name[-len(double):]
     return os.path.splitext(name)[1]  # splitext already treats ".gitignore" as no extension
+
+
+ADMIN_WARNING = ("Warning: page is running as administrator. Windows hides drives mapped by your normal account "
+                 "from it, also blocks drag & drop from Explorer. Close page and start it normally.")
+
+
+def describe_add_error(path, exc):
+    """Why a dropped or chosen path can't be added, as (text, drive_missing)."""
+    drive = os.path.splitdrive(path)[0]
+    if drive and not os.path.exists(drive + os.sep):
+        return f"{path}: drive {drive} isn't available to page.", True
+    if isinstance(exc, FileNotFoundError):
+        return f"{path}: not found (moved or deleted?).", False
+    if isinstance(exc, PermissionError):
+        return f"{path}: access denied.", False
+    return f"{path}: can't be read ({getattr(exc, 'strerror', None) or exc}).", False
+
+
+def problem_lines(problems, elevated):
+    """List unreadable paths (at most 5); if a drive is missing because page runs as
+    administrator, say so once."""
+    lines = [f"  {text}" for text, _ in problems[:5]]
+    if len(problems) > 5:
+        lines.append(f"  ...and {len(problems) - 5} more.")
+    if elevated and any(missing for _, missing in problems):
+        lines.append(ADMIN_WARNING)
+    return "\n".join(lines)
+
+
+def running_elevated():
+    """True when page runs as administrator. Windows then blocks drag and drop from
+    Explorer (a normal-level program) and hides drives mapped by the user's normal
+    session, such as network drives and Cryptomator vaults."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except (AttributeError, OSError):
+        return False
 
 
 def long_path(path):
@@ -731,6 +773,8 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         notice = getattr(self, "settings_notice", None)
         if notice:
             lines += ["", "  " + notice]
+        if running_elevated():
+            lines += ["", ADMIN_WARNING]
         return lines
 
     def show_welcome(self):
@@ -1091,17 +1135,28 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         # tk.splitlist already removed Tcl's {braces}; stripping again would break
         # real names such as "backup{1}" or a "{GUID}" folder.
         # long_path: paths over 260 characters must not be silently skipped.
+        # Paths that can't be read are kept in self.add_problems with the reason.
         expanded = []
         self.skipped_subfolders = 0
+        self.add_problems = []
         for p in paths:
             # Absolute, so Send-to/command-line paths don't depend on the working folder.
-            p = os.path.normpath(os.path.abspath(p))
-            if os.path.isfile(long_path(p)):
+            try:
+                p = os.path.normpath(os.path.abspath(p))
+                info = os.stat(long_path(p))
+            except ValueError:
+                self.add_problems.append((f"{p}: not a valid path.", False))
+                continue
+            except OSError as exc:
+                self.add_problems.append(describe_add_error(p, exc))
+                continue
+            if stat.S_ISREG(info.st_mode):
                 expanded.append(p)
-            elif os.path.isdir(long_path(p)):
+            elif stat.S_ISDIR(info.st_mode):
                 try:
                     names = sorted(os.listdir(long_path(p)))
-                except OSError:
+                except OSError as exc:
+                    self.add_problems.append(describe_add_error(p, exc))
                     continue
                 for name in names:
                     full_path = os.path.join(p, name)
@@ -1129,7 +1184,10 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         new = self.expand_paths(paths)
         if not new:
             # Append, so the welcome text (including any missing-tool line) stays visible.
-            self._write_box("No files found in what was dropped.")
+            if self.add_problems:
+                self._write_box("No files could be added:\n" + problem_lines(self.add_problems, running_elevated()))
+            else:
+                self._write_box("No files found in what was added.")
             return
 
         # Added files join the list instead of replacing it.
@@ -1151,6 +1209,8 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         if self.skipped_subfolders:
             self._write_box(f"{self.skipped_subfolders} subfolder(s) not included: "
                             "a folder adds only the files directly inside it.")
+        if self.add_problems:
+            self._write_box("Not added:\n" + problem_lines(self.add_problems, running_elevated()))
         self.update_mode_from_files()
         self.update_mode_and_input_visibility()
         self.update_action_buttons()
