@@ -16,8 +16,9 @@
 page is unofficial and not affiliated with age's authors. age's own documentation is at [age-encryption.org](https://age-encryption.org) and in the [age repository](https://github.com/FiloSottile/age).
 
 <p align="center">
-  <img src="docs/screenshot-passphrase.png" alt="page, Passphrase tab" width="49%">
-  <img src="docs/screenshot-recipient.png" alt="page, Keys tab" width="49%">
+  <img src="docs/screenshot-start.png" alt="page at start, no files yet" width="32%">
+  <img src="docs/screenshot-passphrase.png" alt="page, Passphrase tab" width="32%">
+  <img src="docs/screenshot-recipient.png" alt="page, Keys tab" width="32%">
 </p>
 
 ## Use it
