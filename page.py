@@ -453,15 +453,16 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
                                         font=small_font)
         self.browse_btn.pack(side="right", padx=(0, 6))
 
-        # Running as administrator: a permanent line above the box, so file lists and
-        # job logs can't push it out of view.
-        if running_elevated():
-            # A small starting wraplength so it never widens the window; wrap_to_width then
-            # follows the real width (and rewraps on resize).
-            self.admin_banner = ctk.CTkLabel(files_frame, text=ADMIN_WARNING, text_color=WARN, font=small_font,
-                                             wraplength=300, justify="left", anchor="w")
-            self.admin_banner.pack(fill="x", pady=(6, 0))
-            self.wrap_to_width(self.admin_banner, side_padding=0)
+        # Running as administrator: a warning dialog at start (like About), and an amber
+        # "Admin" pill in the header that reopens it, so a later blocked drag still has
+        # an explanation on screen.
+        self.elevated = running_elevated()
+        if self.elevated:
+            self.admin_chip = ctk.CTkButton(header, text="Admin", width=60, height=24, corner_radius=12,
+                                            border_width=2, border_color=WARN, fg_color="transparent",
+                                            hover_color=("#f6e3cc", "#3a2c1a"), text_color=WARN,
+                                            font=(self.ui_font, 12, "bold"), command=self.show_admin_warning)
+            self.admin_chip.pack(side="left", padx=(10, 0))
 
         self.drop_border = ctk.ThemeManager.theme["CTkTextbox"]["border_color"]
         # A small requested height: the box still expands into all free space, but Tk
@@ -568,6 +569,8 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(50, self.process_ui_queue)
+        if self.elevated:
+            self.after(400, self.show_admin_warning)  # once the main window is on screen
 
     # ------------------------------------------------------------------ helpers
 
@@ -643,9 +646,7 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         # Same size as sage (590 x 660), so the two apps look alike.
         width = min(590, int(sw / scaling) - 20)
         height = min(660, int((sh - title_bar) / scaling) - 10)
-        # The administrator warning line takes about 45 px more; don't let it squeeze the tab card.
-        min_height = 540 + (45 if getattr(self, "admin_banner", None) is not None else 0)
-        self.minsize(min(520, width), min(min_height, height))
+        self.minsize(min(520, width), min(540, height))
         x = sx + max(0, (sw - int(width * scaling)) // 2)
         y = sy + max(0, (sh - int(height * scaling) - title_bar) // 2)
         self.geometry(f"{width}x{height}+{x}+{y}")
@@ -1188,7 +1189,40 @@ class AgeGui(ctk.CTk, TkinterDnD.DnDWrapper):
         self.link_label(body, AGE_URL).pack()
         ctk.CTkButton(body, text="Close", width=100, height=32, command=win.destroy,
                       font=self.small_font).pack(pady=(18, 0))
+        win.bind("<Escape>", lambda _e: win.destroy())
+        self.center_over_window(win)
         win.after(150, win.focus_force)  # CTkToplevel otherwise opens behind the main window
+
+    def show_admin_warning(self):
+        """The running-as-administrator warning, as a dialog like About."""
+        win = ctk.CTkToplevel(self)
+        win.title(APP_NAME)
+        win.resizable(False, False)
+        win.transient(self)
+        body = ctk.CTkFrame(win, fg_color="transparent")
+        body.pack(padx=28, pady=20)
+        ring = ctk.CTkFrame(body, width=56, height=56, corner_radius=28, border_width=3,
+                            border_color=WARN, fg_color="transparent")
+        ring.pack(pady=(0, 6))
+        ring.pack_propagate(False)
+        ctk.CTkLabel(ring, text="!", text_color=WARN, font=(self.ui_font, 26, "bold"),
+                     fg_color="transparent").place(relx=0.5, rely=0.5, anchor="center")
+        ctk.CTkLabel(body, text="Warning", font=(self.ui_font, 22, "bold")).pack()
+        ctk.CTkLabel(body, text=ADMIN_WARNING.removeprefix("Warning: "), font=(self.ui_font, 14),
+                     wraplength=380, justify="center").pack(pady=(8, 0))
+        close = ctk.CTkButton(body, text="Close", width=100, height=32, command=win.destroy,
+                              font=self.small_font)
+        close.pack(pady=(18, 0))
+        win.bind("<Escape>", lambda _e: win.destroy())
+        self.center_over_window(win)
+        win.after(150, lambda: (win.focus_force(), close.focus_set()))  # CTkToplevel otherwise opens behind
+
+    def center_over_window(self, win):
+        """Place a dialog in the middle of the main window instead of the screen's corner."""
+        win.update_idletasks()  # the dialog isn't on screen yet: use its requested size
+        x = self.winfo_rootx() + (self.winfo_width() - win.winfo_reqwidth()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - win.winfo_reqheight()) // 3
+        win.geometry(f"+{max(0, x)}+{max(0, y)}")  # position only, in physical pixels
 
     def link_label(self, parent, url):
         """A label that opens url in the default browser."""
